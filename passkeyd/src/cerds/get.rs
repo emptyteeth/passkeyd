@@ -347,6 +347,14 @@ fn authorization(
 * idk, it just doesn’t feel right to check those initially when it could’ve clearly changed later over a long duration.
 */
 
+/// Fall back to the password, recording why. These failures used to be
+/// swallowed silently, which made a mis-declared D-Bus signature look like
+/// "no fingerprint hardware".
+fn fingerprint_fallback(context: &str, error: impl std::fmt::Display) -> AuthorizationOutcome {
+    info!("[Fingerprint] {context}: {error}");
+    AuthorizationOutcome::FallbackToPassword(FallbackToPasswordReason::FingerprintDeviceUnavailable)
+}
+
 fn authorization_fprint(
     hid: &mut Ctaphid,
     channel: Channel,
@@ -355,49 +363,52 @@ fn authorization_fprint(
     _reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
     let Ok(connection) = Connection::system() else {
-        return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
+        return Ok(fingerprint_fallback(
+            "cannot reach the system bus",
+            "connection failed",
         ));
     };
     let Ok(fprint_manager) = FprintManagerProxyBlocking::new(&connection) else {
-        return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
+        return Ok(fingerprint_fallback(
+            "fprintd manager is unavailable",
+            "is fprintd installed?",
         ));
     };
 
-    let Ok(device_path) = fprint_manager.get_default_device() else {
-        return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
-        ));
+    let device_path = match fprint_manager.get_default_device() {
+        Ok(path) => path,
+        Err(error) => return Ok(fingerprint_fallback("no default fingerprint device", error)),
     };
 
-    let Ok(fprint_device) = FprintDeviceProxyBlocking::new(&connection, device_path) else {
-        return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
+    let Ok(fprint_device) = FprintDeviceProxyBlocking::new(&connection, &device_path) else {
+        return Ok(fingerprint_fallback(
+            "cannot open the fingerprint device",
+            "device proxy failed",
         ));
     };
 
     let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
-    let Ok(enrolled) = fprint_device.list_enrolled_fingers(&username) else {
-        info!("[Fingerprint] No enrolled key found");
-        return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
-        ));
+    let enrolled = match fprint_device.list_enrolled_fingers(&username) {
+        Ok(enrolled) => enrolled,
+        Err(error) => {
+            return Ok(fingerprint_fallback(
+                "cannot list enrolled fingerprints",
+                error,
+            ));
+        }
     };
 
     if enrolled.is_empty() {
-        info!("[Fingerprint] No enrolled key found");
+        info!("[Fingerprint] No enrolled fingerprint for {username}");
         return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
+            FallbackToPasswordReason::NoEnrolledFingerprints,
         ));
     }
 
-    debug!("[Fingerprint] Claming device...");
-    if fprint_device.claim(&username).is_err() {
-        return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
-        ));
-    };
+    debug!("[Fingerprint] Claiming device...");
+    if let Err(error) = fprint_device.claim(&username) {
+        return Ok(fingerprint_fallback("cannot claim the device", error));
+    }
 
     fprint_device.verify_start("")?;
 
