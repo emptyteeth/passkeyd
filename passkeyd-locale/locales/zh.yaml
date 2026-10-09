@@ -28,6 +28,12 @@ ui:
       helper_text: "身份验证失败，请重试。"
       password: "输入你的口令"
       description: "输入你的口令以授权此通行密钥请求"
+      fingerprint_unavailable: "指纹验证不可用。请改输入你的口令。"
+      pam_unavailable: "PAM 验证不可用。请改输入你的口令。"
+    fingerprint:
+      title_bar: "确认身份"
+      description: "触摸指纹传感器以授权此通行密钥请求"
+      helper_text: "指纹不匹配，请重试。"
 
     select:
       title_bar: "选择通行密钥"

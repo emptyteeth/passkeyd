@@ -29,6 +29,12 @@ ui:
       helper_text: "Authentifizierung fehlgeschlagen, bitte versuchen Sie es erneut."
       password: "Geben Sie Ihre Passphrase ein"
       description: "Geben Sie Ihre Passphrase ein, um diese Passkey-Anfrage zu autorisieren"
+      fingerprint_unavailable: "Fingerabdruckprüfung ist nicht verfügbar. Geben Sie stattdessen Ihre Passphrase ein."
+      pam_unavailable: "PAM-Authentifizierung ist nicht verfügbar. Geben Sie stattdessen Ihre Passphrase ein."
+    fingerprint:
+      title_bar: "Sicherstellen, dass Sie es sind"
+      description: "Berühren Sie den Fingerabdrucksensor, um diese Passkey-Anfrage zu autorisieren"
+      helper_text: "Kein Treffer, bitte versuchen Sie es erneut."
     select:
       title_bar: "Passkey auswählen"
       description: "Die Website %{site} fordert die Verwendung eines Passkeys an."

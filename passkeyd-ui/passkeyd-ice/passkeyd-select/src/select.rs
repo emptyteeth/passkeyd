@@ -3,6 +3,7 @@ use iced::widget::scrollable::Scrollbar;
 use iced::widget::{Column, column, container, scrollable, text};
 use iced::{Alignment, Element, Length, Padding};
 
+use passkeyd_abi::config::Auth;
 use passkeyd_abi::{component::title_bar_component, database::layout::OtherUI, theme};
 use serde::{Deserialize, Serialize};
 
@@ -11,18 +12,13 @@ pub struct SelectionUI {
     pub rp: PublicKeyCredentialRpEntity,
     pub other_uis: Vec<OtherUI>,
     pub no_pass: bool,
+    pub auth: Auth,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum UserResponse {
     Deny,
     Authorize(usize),
-}
-
-#[derive(Serialize)]
-pub struct SelectionResponse<'a> {
-    pub index: usize,
-    pub passphrase: &'a str,
 }
 
 impl SelectionUI {

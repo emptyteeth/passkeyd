@@ -7,8 +7,8 @@ use ctap_types::{
 use log::debug;
 use serde::Serialize;
 use std::{
-    io::Write,
-    process::{Child, Command, Stdio},
+    os::fd::AsRawFd,
+    process::{Child, ChildStdin, Command, Stdio},
 };
 use uuid::Uuid;
 
@@ -162,11 +162,34 @@ impl UI {
 
 pub struct SystemdChild {
     pub inner: Child,
+    /// Kept alive for the whole UI session: the daemon pushes `ServiceMessage`s
+    /// (retries, password fallbacks, PAM questions) through this pipe.
+    pub stdin: ChildStdin,
     unit: String,
     uid: u32,
 }
 
 impl SystemdChild {
+    pub fn send(&mut self, message: &ServiceMessage) -> anyhow::Result<()> {
+        crate::framing::write_frame(&mut self.stdin, message).map_err(Into::into)
+    }
+
+    /// Wait for the UI to exit on its own, up to `timeout`.
+    ///
+    /// Used after a terminal `ServiceMessage` so the UI gets to shut down
+    /// cleanly instead of being SIGKILLed by `Drop` mid-render.
+    pub fn wait_for_exit(&mut self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            match self.inner.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
     pub fn kill(&mut self) -> std::io::Result<()> {
         // No need for killing inner, as
         // --wait is passed in systemd
@@ -183,13 +206,41 @@ impl SystemdChild {
     }
 }
 
+impl Drop for SystemdChild {
+    fn drop(&mut self) {
+        // Every path that abandons the UI — cancel, error, early return — has to
+        // tear the unit down, otherwise it lingers until the session ends.
+        let _ = self.kill();
+        // Reap only if the unit goes away promptly. `--wait` keeps systemd-run
+        // alive for as long as the unit is, so blocking here would hang the
+        // daemon whenever the kill did not take effect.
+        let _ = self.wait_for_exit(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Non-blocking readiness check for a pipe. Used on both sides of the IPC to
+/// decide whether a frame is waiting before attempting a read.
+pub trait Readiness {
+    fn is_readable(&self) -> bool;
+}
+
+impl<T: AsRawFd> Readiness for T {
+    fn is_readable(&self) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        ret > 0 && (pollfd.revents & libc::POLLIN != 0)
+    }
+}
+
 // Util function
 pub fn spawn_ui<State>(config: &Config, ui: UI, state: State) -> SystemdChild
 where
     State: Serialize,
 {
-    let mut state_buffer = CborVec::default();
-    let cbor = cbor_serialize_to(&state, &mut state_buffer).unwrap();
     debug!("Spawning UI");
     let unit = format!("passkeyd-interface-{}", Uuid::new_v4());
     let mut child = std::process::Command::new("systemd-run")
@@ -207,12 +258,11 @@ where
         .spawn()
         .expect("Failed to spawn UI, are you root?");
     let mut stdin = child.stdin.take().expect("Failed to get stdin");
-    stdin
-        .write_all(&state_buffer.0[..cbor])
-        .expect("Failed to write into pipe");
+    crate::framing::write_frame(&mut stdin, &state).expect("Failed to write the initial UI state");
 
     SystemdChild {
         inner: child,
+        stdin,
         uid: config.gui_uid,
         unit,
     }
@@ -236,25 +286,34 @@ pub struct SelectUI<'a> {
     pub rp: &'a PublicKeyCredentialRpEntity,
     pub other_uis: Vec<&'a OtherUI>,
     pub no_pass: bool,
+    /// Which verification screen the UI should present.
+    pub auth: crate::config::Auth,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum UIMessage {
     SelectionDoneMaybeStartAuth(usize),
-    // assuming, the device is fine, non-hacked.
-    // and, no need to do zero bytes
-    PAMAnswer(String),
+    /// The user's answer to a verification prompt. Used for both the password
+    /// and PAM modes; the UI has one input field either way.
+    ///
+    /// The value is not zeroed on the wire — the pipe is private to the daemon
+    /// and the under-privileged UI process.
     Password(String),
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum ServiceMessage {
     FallbackToPassword(FallbackToPasswordReason),
     PAMQuestion(ConversationQuestion),
+    /// The last answer was rejected; keep the UI open for another attempt.
     Retry,
+    /// Verification succeeded. The UI no longer has anything to wait for.
+    Authorized,
+    /// Verification failed for good. The UI should close and report denial.
+    Denied,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum ConversationQuestion {
     Info(String),
     SensitiveInput(String),
@@ -262,7 +321,7 @@ pub enum ConversationQuestion {
     Error(String),
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum FallbackToPasswordReason {
     FingerprintDeviceUnavailable,
     FingerprintUserUnavailable,

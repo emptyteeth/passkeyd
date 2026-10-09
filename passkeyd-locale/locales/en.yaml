@@ -29,6 +29,12 @@ ui:
       helper_text: "Authentication failed, try again."
       password: "Enter your passphrase"
       description: "Enter your passphrase to authorize this passkey request"
+      fingerprint_unavailable: "Fingerprint verification is unavailable. Enter your passphrase instead."
+      pam_unavailable: "PAM authentication is unavailable. Enter your passphrase instead."
+    fingerprint:
+      title_bar: "Making sure it's you"
+      description: "Touch the fingerprint sensor to authorize this passkey request"
+      helper_text: "No match, please try again."
     select:
       title_bar: "Select Passkey"
       description: "The site %{site} is requesting to use a passkey."

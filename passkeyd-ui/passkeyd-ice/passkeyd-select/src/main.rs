@@ -1,26 +1,35 @@
-use std::{
-    cell::RefCell,
-    io::{Read, Write},
-    process::ExitCode,
-    rc::Rc,
-};
+use std::{cell::RefCell, process::ExitCode, rc::Rc, sync::Mutex};
 
-use ctap_types::serde::cbor_deserialize;
-use iced::{Element, Task, widget::operation::focus_next, window::Settings};
-use pam::Client;
+use iced::{
+    Element, Subscription, Task,
+    futures::{Stream, StreamExt, channel::mpsc},
+    widget::operation::focus_next,
+    window::Settings,
+};
 use zeroize::Zeroize;
 
 use crate::{
-    authorize::AuthorizationUI,
-    select::{SelectionResponse, SelectionUI},
+    authorize::{AuthorizationUI, FingerprintResponse, FingerprintUI},
+    select::SelectionUI,
 };
-use passkeyd_abi::{theme, utils::CborVec};
+use passkeyd_abi::{
+    config::Auth,
+    framing::{read_frame, write_frame},
+    theme,
+    utils::{ConversationQuestion, ServiceMessage, UIMessage},
+};
 
 mod authorize;
 mod select;
 
+/// Receiving end of the daemon -> UI pipe, handed to the iced subscription.
+/// `Subscription::run` needs a `fn` pointer builder, so the receiver is parked
+/// in a static for the builder to pick up.
+static SERVICE_RX: Mutex<Option<mpsc::Receiver<ServiceMessage>>> = Mutex::new(None);
+
 enum Flow {
     Selecting(Box<SelectionUI>),
+    AwaitingFingerprint(FingerprintUI),
     Authorizing(AuthorizationUI),
 }
 
@@ -28,68 +37,109 @@ enum Flow {
 pub enum MessageBridge {
     Selection(select::UserResponse),
     Authorization(authorize::UserResponse),
+    Fingerprint(authorize::FingerprintResponse),
+    Service(ServiceMessage),
+    /// The daemon hung up; there is nobody left to talk to.
+    Disconnected,
 }
 
 struct StateMachine {
     flow: Flow,
-    password: Rc<RefCell<String>>,
-    // By default, it will be zero. Zero indicates it hasn't been updated, which means iced is shut, with no updates.
-    // While storing, always add 1 to the index, which will be normalized at the time of returning.
-    authorized_idx: Rc<RefCell<usize>>,
+    /// Set once the daemon has confirmed success. The daemon is the only
+    /// authority on whether verification passed; the UI just reports it.
+    authorized: Rc<RefCell<bool>>,
 }
 
 impl StateMachine {
     fn update(&mut self, message: MessageBridge) -> Task<MessageBridge> {
         match message {
-            MessageBridge::Selection(selection_message) => match selection_message {
+            MessageBridge::Selection(response) => match response {
                 select::UserResponse::Authorize(i) => {
-                    *self.authorized_idx.borrow_mut() = i + 1;
-                    if let Flow::Selecting(selection) = &self.flow
-                        && selection.no_pass
-                    {
+                    // The daemon expects the chosen index before anything else.
+                    if send(&UIMessage::SelectionDoneMaybeStartAuth(i)).is_err() {
                         return iced::exit();
                     }
-                    self.flow = Flow::Authorizing(AuthorizationUI::default());
+                    match &self.flow {
+                        // No verification to wait for, so the selection itself
+                        // is the authorization.
+                        Flow::Selecting(selection) if selection.no_pass => {
+                            *self.authorized.borrow_mut() = true;
+                            return iced::exit();
+                        }
+                        Flow::Selecting(selection) if selection.auth == Auth::FPRINT => {
+                            self.flow = Flow::AwaitingFingerprint(FingerprintUI::default());
+                        }
+                        _ => self.flow = Flow::Authorizing(AuthorizationUI::default()),
+                    }
                     focus_next()
                 }
                 select::UserResponse::Deny => iced::exit(),
             },
-            MessageBridge::Authorization(authorization_message) => {
-                match authorization_message {
-                    authorize::UserResponse::Authorize => {
-                        if let Flow::Authorizing(authorize) = &mut self.flow {
-                            let login = whoami::username().expect("Failed to get username??");
-                            let mut client = Client::with_password("system-auth")
-                                .expect("Failed to init PAM client!");
-                            client
-                                .conversation_mut()
-                                .set_credentials(login, &authorize.password);
-                            // Entering the wrong password more than the configured 'deny' attempts will lock your account. Even with the correct password, it will still report as invalid.
-                            // To unlock the account, use the command: `faillock --user <username> --reset`, or wait for the configured lock time in PAM, which is usually around 600 seconds (10 minutes).
 
-                            // If the retry count exceeds three, the client must
-                            // assume the password is valid and return it
-                            // reference: passkeyd/src/cerds/get.rs line 113
-                            if client.authenticate().is_ok() || authorize.retry_count >= 3 {
-                                *self.password.borrow_mut() = authorize.password.clone();
-                                return iced::exit();
-                            }
-                            authorize.retry_count += 1;
-                            authorize.is_invalid = true;
+            MessageBridge::Authorization(response) => match response {
+                authorize::UserResponse::Authorize => {
+                    if let Flow::Authorizing(authorize) = &mut self.flow {
+                        // The daemon decides whether this password is correct;
+                        // it answers with `Retry`, `FallbackToPassword`,
+                        // `Authorized` or `Denied`.
+                        let mut pass = std::mem::take(&mut authorize.password);
+                        let sent = send(&UIMessage::Password(pass.clone())).is_ok();
+                        pass.zeroize();
+                        if !sent {
+                            return iced::exit();
                         }
-                        Task::none()
                     }
-                    authorize::UserResponse::ContentChanged(content) => {
-                        if let Flow::Authorizing(authorize) = &mut self.flow {
-                            authorize.password = content;
-                        }
-                        Task::none()
-                    }
-                    authorize::UserResponse::Deny => {
-                        *self.authorized_idx.borrow_mut() = 0;
-                        iced::exit()
-                    }
+                    Task::none()
                 }
+                authorize::UserResponse::ContentChanged(content) => {
+                    if let Flow::Authorizing(authorize) = &mut self.flow {
+                        authorize.password = content;
+                    }
+                    Task::none()
+                }
+                authorize::UserResponse::Deny => iced::exit(),
+            },
+
+            MessageBridge::Fingerprint(FingerprintResponse::Deny) => iced::exit(),
+
+            MessageBridge::Service(message) => self.apply_service_message(message),
+
+            MessageBridge::Disconnected => iced::exit(),
+        }
+    }
+
+    fn apply_service_message(&mut self, message: ServiceMessage) -> Task<MessageBridge> {
+        match message {
+            ServiceMessage::Retry => {
+                match &mut self.flow {
+                    Flow::Authorizing(authorize) => authorize.is_invalid = true,
+                    Flow::AwaitingFingerprint(fingerprint) => fingerprint.retry = true,
+                    Flow::Selecting(_) => {}
+                }
+                Task::none()
+            }
+            ServiceMessage::FallbackToPassword(reason) => {
+                self.flow = Flow::Authorizing(AuthorizationUI::fallback(reason));
+                focus_next()
+            }
+            ServiceMessage::Authorized => {
+                *self.authorized.borrow_mut() = true;
+                iced::exit()
+            }
+            ServiceMessage::Denied => iced::exit(),
+            ServiceMessage::PAMQuestion(question) => {
+                let prompt = match question {
+                    ConversationQuestion::Info(text)
+                    | ConversationQuestion::Input(text)
+                    | ConversationQuestion::SensitiveInput(text)
+                    | ConversationQuestion::Error(text) => text,
+                };
+                // Keep anything already typed; only the prompt text changes.
+                match &mut self.flow {
+                    Flow::Authorizing(authorize) => authorize.prompt = Some(prompt),
+                    _ => self.flow = Flow::Authorizing(AuthorizationUI::pam(prompt)),
+                }
+                focus_next()
             }
         }
     }
@@ -97,59 +147,107 @@ impl StateMachine {
     fn view(&self) -> Element<'_, MessageBridge, theme::StylisedTheme> {
         match &self.flow {
             Flow::Selecting(ui) => ui.view().map(MessageBridge::Selection),
+            Flow::AwaitingFingerprint(ui) => ui.view().map(MessageBridge::Fingerprint),
             Flow::Authorizing(ui) => ui.view().map(MessageBridge::Authorization),
         }
     }
+
+    fn subscription(&self) -> Subscription<MessageBridge> {
+        Subscription::run(service_stream)
+    }
+}
+
+/// Reads frames off the daemon pipe on a dedicated thread. Blocking there is
+/// fine; the iced executor only ever sees a ready-made channel.
+fn spawn_daemon_reader() {
+    let (sender, receiver) = mpsc::channel(16);
+    *SERVICE_RX.lock().expect("service receiver poisoned") = Some(receiver);
+
+    std::thread::spawn(move || {
+        let mut sender = sender;
+        let mut stdin = std::io::stdin().lock();
+        // `Ok(None)` (daemon closed the pipe) and `Err` (protocol failure) both
+        // mean there is nothing more to deliver.
+        while let Ok(Some(message)) = read_frame::<_, ServiceMessage>(&mut stdin) {
+            if sender.try_send(message).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn service_stream() -> impl Stream<Item = MessageBridge> {
+    let receiver = SERVICE_RX
+        .lock()
+        .expect("service receiver poisoned")
+        .take();
+
+    iced::futures::stream::unfold(receiver, |state| async move {
+        let mut receiver = state?;
+        match receiver.next().await {
+            Some(message) => Some((MessageBridge::Service(message), Some(receiver))),
+            None => Some((MessageBridge::Disconnected, None)),
+        }
+    })
+}
+
+fn send(message: &UIMessage) -> std::io::Result<()> {
+    write_frame(&mut std::io::stdout().lock(), message)
 }
 
 pub fn main() -> ExitCode {
     passkeyd_locale::init_translations();
 
-    let authorized_idx = Rc::new(RefCell::new(0));
-    let password = Rc::new(RefCell::new(String::with_capacity(8)));
-
-    let authorized_idx_clone = Rc::clone(&authorized_idx);
-    let authorized_password_clone = Rc::clone(&password);
+    let authorized = Rc::new(RefCell::new(false));
+    let authorized_clone = Rc::clone(&authorized);
 
     let bootfn = move || {
-        let mut state_buffer = Vec::with_capacity(size_of::<SelectionUI>());
-        std::io::stdin()
-            .read_to_end(&mut state_buffer)
-            .expect("Failed to read input");
-        let selection_ui: SelectionUI =
-            cbor_deserialize(&state_buffer).expect("Invalid cbor received");
+        let selection_ui: SelectionUI = {
+            let mut stdin = std::io::stdin().lock();
+            read_frame(&mut stdin)
+                .expect("Failed to read the initial state")
+                .expect("The daemon closed the pipe before sending any state")
+        };
         let needs_selection = selection_ui.other_uis.len() > 1;
         let skip_password = selection_ui.no_pass;
 
-        let state = StateMachine {
-            authorized_idx: if needs_selection {
-                Rc::clone(&authorized_idx_clone)
-            } else {
-                *authorized_idx_clone.borrow_mut() = 1;
-                Rc::clone(&authorized_idx_clone)
-            },
-            password: Rc::clone(&authorized_password_clone),
-            flow: if needs_selection {
-                Flow::Selecting(Box::new(selection_ui))
-            } else {
-                Flow::Authorizing(AuthorizationUI::default())
-            },
+        // A single passkey needs no picker, so go straight to verification.
+        let flow = if needs_selection {
+            Flow::Selecting(Box::new(selection_ui))
+        } else {
+            match selection_ui.auth {
+                Auth::FPRINT => Flow::AwaitingFingerprint(FingerprintUI::default()),
+                _ => Flow::Authorizing(AuthorizationUI::default()),
+            }
         };
 
-        if !needs_selection && skip_password {
-            if write_output(0, &mut authorized_password_clone.borrow_mut()).is_err() {
+        let state = StateMachine {
+            authorized: Rc::clone(&authorized_clone),
+            flow,
+        };
+
+        if !needs_selection {
+            // With a single credential there is no picker, but the daemon still
+            // blocks on the chosen index before it will start verifying, so
+            // report it up front.
+            if send(&UIMessage::SelectionDoneMaybeStartAuth(0)).is_err() {
                 std::process::exit(1);
             }
-            std::process::exit(0);
-            // (state, iced::exit())
-        } else if !needs_selection {
-            (state, focus_next())
-        } else {
-            (state, Task::none())
+            if skip_password {
+                // No verification either: the daemon just needs the UI to close.
+                *authorized_clone.borrow_mut() = true;
+                std::process::exit(0);
+            }
+            spawn_daemon_reader();
+            return (state, focus_next());
         }
+
+        spawn_daemon_reader();
+        (state, Task::none())
     };
 
     let _ = iced::application(bootfn, StateMachine::update, StateMachine::view)
+        .subscription(StateMachine::subscription)
         .window(Settings {
             maximized: false,
             minimizable: false,
@@ -166,97 +264,9 @@ pub fn main() -> ExitCode {
         .theme(|_state: &StateMachine| theme::StylisedTheme::default())
         .run();
 
-    let index = *authorized_idx.borrow();
-    if index == 0
-        || write_output(
-            index.saturating_sub(1), //normalization
-            &mut password.borrow_mut(),
-        )
-        .is_err()
-    {
-        return ExitCode::FAILURE;
-    }
-
-    ExitCode::SUCCESS
-}
-
-fn write_output(authorized_index: usize, passphrase: &mut str) -> std::io::Result<()> {
-    let mut stdout = std::io::stdout().lock();
-
-    stdout.write_all(&[0x02])?; // Start of Text
-    let report = CborVec::from_serializable(
-        SelectionResponse {
-            index: authorized_index,
-            passphrase,
-        },
-        size_of::<SelectionResponse>(),
-    );
-    stdout.write_all(&report.into_inner())?;
-    stdout.flush()?;
-
-    passphrase.zeroize();
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ctap_types::{serde::cbor_serialize, webauthn::PublicKeyCredentialRpEntity};
-    use passkeyd_abi::database::layout::OtherUI;
-    use std::{env, io::Write, path::PathBuf, process::Stdio};
-
-    #[test]
-    fn test_passkey_selection_process() {
-        let mut buffer = [0; 10000];
-        let other_ui = (0..=5)
-            .map(|idx| OtherUI {
-                site_icon: None,
-                user_icon: None,
-                user: ctap_types::webauthn::PublicKeyCredentialUserEntity {
-                    id: ctap_types::Bytes::from_slice(&[1u8; 64])
-                        .expect("Failed to create user ID"),
-                    icon: None,
-                    name: Some("Github".into()),
-                    display_name: Some(format!("acc-{idx}").as_str().into()),
-                },
-            })
-            .collect::<Vec<_>>();
-
-        let authorization_ui = SelectionUI {
-            rp: PublicKeyCredentialRpEntity {
-                id: "github.com".into(),
-                name: Some("Github".into()),
-                icon: None,
-            },
-            other_uis: other_ui,
-            no_pass: true,
-        };
-        let serialized_data =
-            cbor_serialize(&authorization_ui, &mut buffer[..]).expect("Serialization failed");
-        let passkeyd_enroll_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/passkeyd-select");
-        let mut command = std::process::Command::new("systemd-run")
-            .arg(format!("--machine={}@", 1000))
-            .arg("--user")
-            .arg("--collect")
-            .arg("--wait")
-            .arg("--quiet")
-            .arg("--pipe")
-            .arg(passkeyd_enroll_path.as_os_str())
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn UI process. Are you root?");
-
-        {
-            let mut stdin = command.stdin.take().expect("Failed to get stdin");
-            stdin
-                .write_all(&serialized_data)
-                .expect("Failed to write data into pipe");
-        }
-
-        let result = command.wait().expect("Failed to collect UI response");
-        let exit_code = result.code().unwrap_or(1);
-
-        assert_eq!(exit_code, 0);
+    if *authorized.borrow() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

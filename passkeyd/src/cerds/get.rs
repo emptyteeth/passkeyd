@@ -1,13 +1,10 @@
-use std::io::{Read, Write};
 use std::mem::MaybeUninit;
-use std::process::{ChildStdin, ChildStdout};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 use anyhow::Context;
 use ctap_types::ctap2::AuthenticatorDataFlags;
 use ctap_types::ctap2::get_assertion::{AuthenticatorData, Request, Response, ResponseBuilder};
-use ctap_types::serde::cbor_deserialize;
 use ctap_types::{Bytes, webauthn::PublicKeyCredentialRpEntity};
 use ctaphid_types::{Channel, DeviceError};
 use log::{debug, error, info};
@@ -15,8 +12,9 @@ use sha2::Digest;
 
 use passkeyd_abi::config::{Auth, Config};
 use passkeyd_abi::database::{get_passkeys, layout::Passkey};
+use passkeyd_abi::framing::FrameReader;
 use passkeyd_abi::utils::{
-    CborVec, FallbackToPasswordReason, PresenceUI, SelectUI, ServiceMessage, SystemdChild, UI,
+    FallbackToPasswordReason, PresenceUI, Readiness, SelectUI, ServiceMessage, SystemdChild, UI,
     UIMessage, spawn_ui,
 };
 use zbus::blocking::Connection;
@@ -27,7 +25,7 @@ use crate::auth::pass::verify_password;
 use crate::cryptography;
 use crate::ctaphid::ctaphid::Ctaphid;
 use crate::ctaphid::{CtapStatus, TransportError};
-use crate::utils::{Readiness, cancellable_ui, has_another_fido_device};
+use crate::utils::{cancellable_ui, has_another_fido_device};
 
 pub fn get(
     hid: &mut Ctaphid,
@@ -257,6 +255,7 @@ fn authorize_selection(
             .map(|passkey| &passkey.credential_source.other_ui)
             .collect(),
         no_pass: config.no_pass,
+        auth: config.auth,
     };
 
     authenticate_handler(hid, channel, config, ui_state)
@@ -269,6 +268,10 @@ enum AuthorizationOutcome {
     FallbackToPassword(FallbackToPasswordReason),
 }
 
+/// How long the UI gets to shut itself down after a terminal service message
+/// before the daemon kills its unit.
+const UI_EXIT_GRACE: Duration = Duration::from_millis(500);
+
 fn authenticate_handler(
     hid: &mut Ctaphid,
     channel: Channel,
@@ -276,25 +279,18 @@ fn authenticate_handler(
     ui_state: SelectUI,
 ) -> anyhow::Result<usize> {
     let mut child = spawn_ui(config, UI::KeySelect, ui_state);
-    let mut stdin = child.inner.stdin.take().unwrap();
-    let mut stdout = child.inner.stdout.take().unwrap();
-    let mut event_buf = Vec::new();
+    let mut reader = FrameReader::new();
 
     loop {
-        if let Some(event) = try_ui_message(hid, channel, &mut child, &mut stdout, &mut event_buf)?
-        {
+        if let Some(event) = try_ui_message(hid, channel, &mut child, &mut reader)? {
             match event {
                 UIMessage::SelectionDoneMaybeStartAuth(i) => {
                     if !config.no_pass {
-                        authorization(
-                            hid,
-                            channel,
-                            config,
-                            &mut child,
-                            &mut stdin,
-                            &mut stdout,
-                            &mut event_buf,
-                        )?;
+                        authorization(hid, channel, config, &mut child, &mut reader)?;
+                    } else {
+                        // Nothing further is expected from the UI; let it close
+                        // itself rather than killing it mid-render.
+                        child.wait_for_exit(UI_EXIT_GRACE);
                     }
                     return Ok(i);
                 }
@@ -312,39 +308,38 @@ fn authorization(
     channel: Channel,
     config: &Config,
     child: &mut SystemdChild,
-    stdin: &mut ChildStdin,
-    stdout: &mut ChildStdout,
-    event_buf: &mut Vec<u8>,
+    reader: &mut FrameReader,
 ) -> anyhow::Result<()> {
     let mut auth = &config.auth;
     loop {
         let auth_outcome = match auth {
-            Auth::PASS => authorization_pass(hid, channel, config, child, stdin, stdout, event_buf),
-            Auth::FPRINT => {
-                authorization_fprint(hid, channel, config, child, stdin, stdout, event_buf)
-            }
-            Auth::PAM => authorization_pam(hid, channel, config, child, stdin, stdout, event_buf),
+            Auth::PASS => authorization_pass(hid, channel, config, child, reader),
+            Auth::FPRINT => authorization_fprint(hid, channel, config, child, reader),
+            Auth::PAM => authorization_pam(hid, channel, config, child, reader),
         };
 
+        // The UI owns the final "granted"/"denied" signal, so tell it how the
+        // attempt ended before acting on the outcome ourselves. These sends are
+        // best-effort: if the UI already closed itself the outcome still stands.
         match auth_outcome? {
             AuthorizationOutcome::Authorized => {
+                let _ = child.send(&ServiceMessage::Authorized);
+                // Give the UI a moment to tear itself down before `Drop` kills
+                // the unit out from under it.
+                child.wait_for_exit(UI_EXIT_GRACE);
                 return Ok(());
             }
             AuthorizationOutcome::UnAuthorized => {
+                let _ = child.send(&ServiceMessage::Denied);
+                child.wait_for_exit(UI_EXIT_GRACE);
                 anyhow::bail!(CtapStatus::UvBlocked);
             }
             AuthorizationOutcome::FallbackToPassword(reason) => {
                 auth = &Auth::PASS;
-                send_command(stdin, ServiceMessage::FallbackToPassword(reason))?;
+                child.send(&ServiceMessage::FallbackToPassword(reason))?;
             }
         }
     }
-}
-
-fn send_command(stdin: &mut ChildStdin, command: ServiceMessage) -> anyhow::Result<()> {
-    stdin
-        .write_all(CborVec::from_serializable(command, size_of::<ServiceMessage>()).as_ref())
-        .map_err(anyhow::Error::from)
 }
 
 /*
@@ -357,11 +352,9 @@ fn authorization_fprint(
     channel: Channel,
     config: &Config,
     child: &mut SystemdChild,
-    stdin: &mut ChildStdin,
-    _stdout: &mut ChildStdout,
-    _event_buf: &mut Vec<u8>,
+    _reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
-    let Ok(connection) = Connection::session() else {
+    let Ok(connection) = Connection::system() else {
         return Ok(AuthorizationOutcome::FallbackToPassword(
             FallbackToPasswordReason::FingerprintDeviceUnavailable,
         ));
@@ -386,20 +379,20 @@ fn authorization_fprint(
 
     let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
     let Ok(enrolled) = fprint_device.list_enrolled_fingers(&username) else {
-        info!("[Fingureprint] No enrolled key found");
+        info!("[Fingerprint] No enrolled key found");
         return Ok(AuthorizationOutcome::FallbackToPassword(
             FallbackToPasswordReason::FingerprintDeviceUnavailable,
         ));
     };
 
     if enrolled.is_empty() {
-        info!("[Fingureprint] No enrolled key found");
+        info!("[Fingerprint] No enrolled key found");
         return Ok(AuthorizationOutcome::FallbackToPassword(
             FallbackToPasswordReason::FingerprintDeviceUnavailable,
         ));
     }
 
-    debug!("[Fingureprint] Claming device...");
+    debug!("[Fingerprint] Claming device...");
     if fprint_device.claim(&username).is_err() {
         return Ok(AuthorizationOutcome::FallbackToPassword(
             FallbackToPasswordReason::FingerprintDeviceUnavailable,
@@ -430,7 +423,7 @@ fn authorization_fprint(
                 "verify-match" => {
                     let _ = fprint_device.verify_stop();
                     let _ = fprint_device.release();
-                    debug!("[Fingureprint] Releasing device...");
+                    debug!("[Fingerprint] Releasing device...");
                     return Ok(AuthorizationOutcome::Authorized);
                 }
                 "verify-no-match" => {
@@ -439,21 +432,21 @@ fn authorization_fprint(
                     if attempts >= MAX_ATTEMPTS {
                         let _ = fprint_device.verify_stop();
                         let _ = fprint_device.release();
-                        debug!("[Fingureprint] Releasing device...");
+                        debug!("[Fingerprint] Releasing device...");
                         return Ok(AuthorizationOutcome::UnAuthorized);
                     }
 
-                    send_command(stdin, ServiceMessage::Retry)?;
+                    child.send(&ServiceMessage::Retry)?;
                 }
                 "verify-unknown-error" => {
                     let _ = fprint_device.verify_stop();
                     let _ = fprint_device.release();
-                    debug!("[Fingureprint] Releasing device...");
+                    debug!("[Fingerprint] Releasing device...");
                     return Ok(AuthorizationOutcome::FallbackToPassword(
                         FallbackToPasswordReason::FingerprintDeviceUnavailable,
                     ));
                 }
-                _ => send_command(stdin, ServiceMessage::Retry)?,
+                _ => child.send(&ServiceMessage::Retry)?,
             };
         };
 
@@ -471,8 +464,7 @@ fn authorization_fprint(
         if try_recv_cancel(hid, channel)?.is_some() {
             let _ = fprint_device.verify_stop();
             let _ = fprint_device.release();
-            let _ = child.kill();
-            let _ = child.inner.wait();
+            // Dropping `child` kills the unit and reaps the process.
             anyhow::bail!(CtapStatus::KeepaliveCancel);
         };
 
@@ -485,9 +477,7 @@ fn authorization_pam(
     channel: Channel,
     _config: &Config,
     child: &mut SystemdChild,
-    stdin: &mut ChildStdin,
-    stdout: &mut ChildStdout,
-    event_buf: &mut Vec<u8>,
+    reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
     // let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
 
@@ -502,7 +492,7 @@ fn authorization_pam(
 
     let Ok(mut client) = pam::Client::with_conversation("passkeyd", conv) else {
         return Ok(AuthorizationOutcome::FallbackToPassword(
-            FallbackToPasswordReason::FingerprintDeviceUnavailable,
+            FallbackToPasswordReason::PamUnavailable,
         ));
     };
 
@@ -512,12 +502,12 @@ fn authorization_pam(
 
     loop {
         if let Ok(question) = question_rx.try_recv() {
-            send_command(stdin, ServiceMessage::PAMQuestion(question))?;
+            child.send(&ServiceMessage::PAMQuestion(question))?;
         }
 
-        if let Some(UIMessage::Password(ans)) =
-            try_ui_message(hid, channel, child, stdout, event_buf)?
-        {
+        // The UI has a single answer channel regardless of auth mode, so a PAM
+        // prompt is answered with the same `Password` message.
+        if let Some(UIMessage::Password(ans)) = try_ui_message(hid, channel, child, reader)? {
             answer_tx
                 .send(ans)
                 .map_err(|_| anyhow::anyhow!("Unexpectedly, PAM authentication thread died"))?;
@@ -544,18 +534,14 @@ fn authorization_pass(
     channel: Channel,
     config: &Config,
     child: &mut SystemdChild,
-    stdin: &mut ChildStdin,
-    stdout: &mut ChildStdout,
-    event_buf: &mut Vec<u8>,
+    reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
     let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
     const MAX_ATTEMPTS: usize = 3;
     let mut attempts = 0;
 
     loop {
-        if let Some(UIMessage::Password(pass)) =
-            try_ui_message(hid, channel, child, stdout, event_buf)?
-        {
+        if let Some(UIMessage::Password(pass)) = try_ui_message(hid, channel, child, reader)? {
             if verify_password(&username, &pass)? {
                 return Ok(AuthorizationOutcome::Authorized);
             }
@@ -563,7 +549,7 @@ fn authorization_pass(
             if attempts >= MAX_ATTEMPTS {
                 return Ok(AuthorizationOutcome::UnAuthorized);
             }
-            send_command(stdin, ServiceMessage::Retry)?;
+            child.send(&ServiceMessage::Retry)?;
         };
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -602,39 +588,36 @@ fn try_ui_message(
     hid: &mut Ctaphid,
     channel: Channel,
     child: &mut SystemdChild,
-    stdout: &mut ChildStdout,
-    event_buf: &mut Vec<u8>,
+    reader: &mut FrameReader,
 ) -> anyhow::Result<Option<UIMessage>> {
     if try_recv_cancel(hid, channel)?.is_some() {
-        let _ = child.kill();
-        let _ = child.inner.wait();
+        // Dropping `child` kills the unit and reaps the process.
         anyhow::bail!(CtapStatus::KeepaliveCancel);
     };
 
-    if let Some(_) = child
+    // Drain the pipe before looking at the exit status: a UI that reports its
+    // result and exits immediately still has a frame waiting to be read.
+    if let Some(stdout) = child.inner.stdout.as_mut()
+        && stdout.is_readable()
+    {
+        match reader.poll(stdout) {
+            Ok(Some(message)) => return Ok(Some(message)),
+            // The child closed its end; fall through to the exit check below.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(e.into()),
+            Ok(None) => {}
+        }
+    }
+
+    if child
         .inner
         .try_wait()
         .context("failed to poll UI process")?
+        .is_some()
     {
         anyhow::bail!(CtapStatus::OperationDenied);
     }
 
-    if stdout.is_readable() {
-        let mut temp_buff = [0; 512];
-        loop {
-            match cbor_deserialize(event_buf.as_slice()) {
-                Ok(res) => return Ok(res),
-                Err(_) => {
-                    // If it failed probably because don't got enough bytes read more from stdout.
-                    let n = stdout.read(&mut temp_buff)?;
-                    if n == 0 {
-                        anyhow::bail!("Child stdout closed unexpectedly");
-                    }
-                    event_buf.extend_from_slice(&temp_buff[..n]);
-                }
-            }
-        }
-    }
     Ok(None)
 }
 

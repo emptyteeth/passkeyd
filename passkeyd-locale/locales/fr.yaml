@@ -28,6 +28,12 @@ ui:
       helper_text: "Échec de l’authentification, veuillez réessayer."
       password: "Entrez votre mot de passe"
       description: "Entrez votre mot de passe pour autoriser cette demande de clé d’accès"
+      fingerprint_unavailable: "La vérification par empreinte digitale n’est pas disponible. Saisissez plutôt votre mot de passe."
+      pam_unavailable: "L’authentification PAM n’est pas disponible. Saisissez plutôt votre mot de passe."
+    fingerprint:
+      title_bar: "Vérification de votre identité"
+      description: "Touchez le capteur d’empreintes pour autoriser cette demande de clé d’accès"
+      helper_text: "Aucune correspondance, veuillez réessayer."
 
     select:
       title_bar: "Sélectionner une clé d’accès"

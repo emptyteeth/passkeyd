@@ -1,30 +1,11 @@
-use std::{
-    os::fd::AsRawFd,
-    process::{ChildStdout, ExitStatus},
-};
+use std::process::{ChildStdout, ExitStatus};
 
 use anyhow::Context;
 use ctaphid_types::{Channel, DeviceError};
 use log::{error, info};
-use passkeyd_abi::utils::SystemdChild;
+use passkeyd_abi::utils::{Readiness, SystemdChild};
 
 use crate::ctaphid::{CtapStatus, TransportError, ctaphid::Ctaphid};
-
-pub trait Readiness {
-    fn is_readable(&self) -> bool;
-}
-
-impl<T: AsRawFd> Readiness for T {
-    fn is_readable(&self) -> bool {
-        let mut poolfd = libc::pollfd {
-            fd: self.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut poolfd, 1, 0) };
-        ret > 0 && (poolfd.revents & libc::POLLIN != 0)
-    }
-}
 
 unsafe extern "C" {
     fn hid_init() -> i32;
@@ -136,8 +117,7 @@ pub fn cancellable_ui(
                     });
                 }
                 None if hid.is_cancelled(channel) => {
-                    let _ = child.kill();
-                    let _ = child.inner.wait();
+                    // Dropping the child kills the unit and reaps the process.
                     info!("Killed User Interface");
                     anyhow::bail!(CtapStatus::KeepaliveCancel);
                 }

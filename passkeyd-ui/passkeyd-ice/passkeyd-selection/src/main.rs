@@ -1,13 +1,12 @@
-use std::io::Read;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use ctap_types::serde::cbor_deserialize;
 use iced::widget::{button, column, container, text};
 use iced::window::Settings;
 use iced::{Alignment, Element, Length, Task};
 
 use passkeyd_abi::component::title_bar_component;
+use passkeyd_abi::framing::read_frame;
 use passkeyd_abi::theme;
 
 use serde::{Deserialize, Serialize};
@@ -28,11 +27,10 @@ enum UserResponse {
 static IS_AUTHORIZED: AtomicBool = AtomicBool::new(false);
 impl AuthorizationUI {
     fn bootfn() -> Self {
-        let mut state_buffer = Vec::with_capacity(size_of::<AuthorizationUI>());
-        std::io::stdin()
-            .read_to_end(&mut state_buffer)
-            .expect("Failed to read input");
-        cbor_deserialize(&state_buffer).expect("Invalid cbor received")
+        let mut stdin = std::io::stdin().lock();
+        read_frame(&mut stdin)
+            .expect("Failed to read the initial state")
+            .expect("The daemon closed the pipe before sending any state")
     }
 
     fn update(&mut self, msg: UserResponse) -> Task<UserResponse> {
@@ -114,20 +112,17 @@ pub fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ctap_types::serde::cbor_serialize;
-    use std::{env, io::Write, path::PathBuf, process::Stdio};
+    use passkeyd_abi::framing::write_frame;
+    use std::{env, path::PathBuf, process::Stdio};
 
     #[test]
     fn test_enrollment_process() {
-        let mut buffer = [0; 10000];
         let authorization_ui = AuthorizationUI {
             title: "Passkey selection".into(),
             description: "This site is requesting authentication. Use this passkey to proceed."
                 .into(),
             button: "Use this passkey".into(),
         };
-        let serialized_data =
-            cbor_serialize(&authorization_ui, &mut buffer[..]).expect("Serialization failed");
         let passkeyd_enroll_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/passkeyd-selection");
         let mut command = std::process::Command::new("systemd-run")
@@ -144,9 +139,7 @@ mod tests {
 
         {
             let mut stdin = command.stdin.take().expect("Failed to get stdin");
-            stdin
-                .write_all(&serialized_data)
-                .expect("Failed to write data into pipe");
+            write_frame(&mut stdin, &authorization_ui).expect("Failed to write data into pipe");
         }
 
         let result = command.wait().expect("Failed to collect UI response");
