@@ -191,6 +191,14 @@ impl SystemdChild {
     }
 
     pub fn kill(&mut self) -> std::io::Result<()> {
+        // Nothing to kill if the UI already exited: `--collect` removes the
+        // unit as soon as it stops, and asking systemd to kill it would only
+        // report "Unit ... not loaded". This is the normal path — the UI shuts
+        // itself down after a terminal `ServiceMessage`.
+        if matches!(self.inner.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
+
         // No need for killing inner, as
         // --wait is passed in systemd
         Command::new("systemctl")
