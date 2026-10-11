@@ -1,8 +1,7 @@
-use std::{cell::RefCell, process::ExitCode, rc::Rc, sync::Mutex};
+use std::{cell::RefCell, process::ExitCode, rc::Rc};
 
 use iced::{
-    Element, Subscription, Task,
-    futures::{Stream, StreamExt, channel::mpsc},
+    Element, Task,
     widget::operation::focus_next,
     window::Settings,
 };
@@ -10,22 +9,18 @@ use zeroize::Zeroize;
 
 use crate::{
     authorize::{AuthorizationUI, FingerprintResponse, FingerprintUI},
+    ipc::Incoming,
     select::SelectionUI,
 };
 use passkeyd_abi::{
     config::Auth,
-    framing::{read_frame, write_frame},
     theme,
     utils::{ConversationQuestion, ServiceMessage, UIMessage},
 };
 
 mod authorize;
+mod ipc;
 mod select;
-
-/// Receiving end of the daemon -> UI pipe, handed to the iced subscription.
-/// `Subscription::run` needs a `fn` pointer builder, so the receiver is parked
-/// in a static for the builder to pick up.
-static SERVICE_RX: Mutex<Option<mpsc::Receiver<ServiceMessage>>> = Mutex::new(None);
 
 enum Flow {
     Selecting(Box<SelectionUI>),
@@ -38,9 +33,8 @@ pub enum MessageBridge {
     Selection(select::UserResponse),
     Authorization(authorize::UserResponse),
     Fingerprint(authorize::FingerprintResponse),
-    Service(ServiceMessage),
-    /// The daemon hung up; there is nobody left to talk to.
-    Disconnected,
+    /// Something the daemon sent, or the pipe closing.
+    Incoming(Incoming),
 }
 
 struct StateMachine {
@@ -56,7 +50,7 @@ impl StateMachine {
             MessageBridge::Selection(response) => match response {
                 select::UserResponse::Authorize(i) => {
                     // The daemon expects the chosen index before anything else.
-                    if send(&UIMessage::SelectionDoneMaybeStartAuth(i)).is_err() {
+                    if ipc::send(&UIMessage::SelectionDoneMaybeStartAuth(i)).is_err() {
                         return iced::exit();
                     }
                     match &self.flow {
@@ -83,7 +77,7 @@ impl StateMachine {
                         // it answers with `Retry`, `FallbackToPassword`,
                         // `Authorized` or `Denied`.
                         let mut pass = std::mem::take(&mut authorize.password);
-                        let sent = send(&UIMessage::Password(pass.clone())).is_ok();
+                        let sent = ipc::send(&UIMessage::Password(pass.clone())).is_ok();
                         pass.zeroize();
                         if !sent {
                             return iced::exit();
@@ -102,9 +96,10 @@ impl StateMachine {
 
             MessageBridge::Fingerprint(FingerprintResponse::Deny) => iced::exit(),
 
-            MessageBridge::Service(message) => self.apply_service_message(message),
-
-            MessageBridge::Disconnected => iced::exit(),
+            MessageBridge::Incoming(event) => match event {
+                Incoming::Message(message) => self.apply_service_message(message),
+                Incoming::Closed => iced::exit(),
+            },
         }
     }
 
@@ -151,48 +146,11 @@ impl StateMachine {
             Flow::Authorizing(ui) => ui.view().map(MessageBridge::Authorization),
         }
     }
-
-    fn subscription(&self) -> Subscription<MessageBridge> {
-        Subscription::run(service_stream)
-    }
 }
 
-/// Reads frames off the daemon pipe on a dedicated thread. Blocking there is
-/// fine; the iced executor only ever sees a ready-made channel.
-fn spawn_daemon_reader() {
-    let (sender, receiver) = mpsc::channel(16);
-    *SERVICE_RX.lock().expect("service receiver poisoned") = Some(receiver);
-
-    std::thread::spawn(move || {
-        let mut sender = sender;
-        let mut stdin = std::io::stdin().lock();
-        // `Ok(None)` (daemon closed the pipe) and `Err` (protocol failure) both
-        // mean there is nothing more to deliver.
-        while let Ok(Some(message)) = read_frame::<_, ServiceMessage>(&mut stdin) {
-            if sender.try_send(message).is_err() {
-                break;
-            }
-        }
-    });
-}
-
-fn service_stream() -> impl Stream<Item = MessageBridge> {
-    let receiver = SERVICE_RX
-        .lock()
-        .expect("service receiver poisoned")
-        .take();
-
-    iced::futures::stream::unfold(receiver, |state| async move {
-        let mut receiver = state?;
-        match receiver.next().await {
-            Some(message) => Some((MessageBridge::Service(message), Some(receiver))),
-            None => Some((MessageBridge::Disconnected, None)),
-        }
-    })
-}
-
-fn send(message: &UIMessage) -> std::io::Result<()> {
-    write_frame(&mut std::io::stdout().lock(), message)
+/// Starts listening to the daemon. Called exactly once, from `boot`.
+fn listen_to_daemon() -> Task<MessageBridge> {
+    Task::run(ipc::incoming(), MessageBridge::Incoming)
 }
 
 pub fn main() -> ExitCode {
@@ -202,12 +160,8 @@ pub fn main() -> ExitCode {
     let authorized_clone = Rc::clone(&authorized);
 
     let bootfn = move || {
-        let selection_ui: SelectionUI = {
-            let mut stdin = std::io::stdin().lock();
-            read_frame(&mut stdin)
-                .expect("Failed to read the initial state")
-                .expect("The daemon closed the pipe before sending any state")
-        };
+        let selection_ui: SelectionUI =
+            ipc::initial_state().expect("Failed to read the initial state");
         let needs_selection = selection_ui.other_uis.len() > 1;
         let skip_password = selection_ui.no_pass;
 
@@ -230,7 +184,7 @@ pub fn main() -> ExitCode {
             // With a single credential there is no picker, but the daemon still
             // blocks on the chosen index before it will start verifying, so
             // report it up front.
-            if send(&UIMessage::SelectionDoneMaybeStartAuth(0)).is_err() {
+            if ipc::send(&UIMessage::SelectionDoneMaybeStartAuth(0)).is_err() {
                 std::process::exit(1);
             }
             if skip_password {
@@ -238,16 +192,13 @@ pub fn main() -> ExitCode {
                 *authorized_clone.borrow_mut() = true;
                 std::process::exit(0);
             }
-            spawn_daemon_reader();
-            return (state, focus_next());
+            return (state, Task::batch([listen_to_daemon(), focus_next()]));
         }
 
-        spawn_daemon_reader();
-        (state, Task::none())
+        (state, listen_to_daemon())
     };
 
     let _ = iced::application(bootfn, StateMachine::update, StateMachine::view)
-        .subscription(StateMachine::subscription)
         .window(Settings {
             maximized: false,
             minimizable: false,
