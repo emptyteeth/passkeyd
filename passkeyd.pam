@@ -1,0 +1,8 @@
+#%PAM-1.0
+# PAM stack used when AUTH=pam is set in /etc/passkeyd.conf.
+# passkeyd authenticates through `pam::Client::with_conversation("passkeyd", ..)`,
+# which resolves to this file. Adjust the includes to match your policy.
+auth      include   system-auth
+account   include   system-auth
+password  include   system-auth
+session   include   system-auth

@@ -148,6 +148,9 @@ jobs:
             install -Dm644 passkeyd.conf debian/passkeyd/etc/passkeyd.conf
             install -Dm644 theme.conf debian/passkeyd/usr/share/passkeyd/theme.conf
 
+            # PAM stack for AUTH=pam
+            install -Dm644 passkeyd.pam debian/passkeyd/etc/pam.d/passkeyd
+
             # Systemd service
             install -Dm644 passkeyd.service debian/passkeyd/lib/systemd/system/passkeyd.service
 

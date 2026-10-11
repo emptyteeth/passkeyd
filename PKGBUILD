@@ -11,7 +11,7 @@ url="https://github.com/bjn7/passkeyd"
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/bjn7/passkeyd/releases/download/v$pkgver/passkeyd-x86_64-unknown-linux-gnu.tar.gz")
 sha256sums=('c61ffd4902fc701191a81c1d274e701a5b0cae8451c0c1ed3a1e3fbfdfdad268')
 options=('!debug')
-backup=('etc/passkeyd.conf' 'usr/share/passkeyd/theme.conf')
+backup=('etc/passkeyd.conf' 'usr/share/passkeyd/theme.conf' 'etc/pam.d/passkeyd')
 install=passkeyd.install
 
 package() {
@@ -43,6 +43,9 @@ package() {
   # Configuration files
   install -Dm644 passkeyd.conf "$pkgdir/etc/passkeyd.conf"
   install -Dm644 theme.conf "$pkgdir/usr/share/passkeyd/theme.conf"
+
+  # PAM stack for AUTH=pam
+  install -Dm644 passkeyd.pam "$pkgdir/etc/pam.d/passkeyd"
 
   # Systemd service
   install -Dm644 "$srcdir/passkeyd.service" "$pkgdir/usr/lib/systemd/system/passkeyd.service"
