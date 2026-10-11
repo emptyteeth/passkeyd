@@ -290,7 +290,7 @@ fn authenticate_handler(
     ui_state: SelectUI,
 ) -> anyhow::Result<usize> {
     let mut child = spawn_ui(config, UI::KeySelect, ui_state, uid);
-    let mut reader = FrameReader::new();
+    let mut reader = FrameReader::<UIMessage>::new();
 
     loop {
         if let Some(event) = try_ui_message(hid, channel, &mut child, &mut reader)? {
@@ -320,7 +320,7 @@ fn authorization(
     config: &Config,
     uid: u32,
     child: &mut SystemdChild,
-    reader: &mut FrameReader,
+    reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<()> {
     let mut auth = &config.auth;
     loop {
@@ -372,7 +372,7 @@ fn authorization_fprint(
     channel: Channel,
     uid: u32,
     child: &mut SystemdChild,
-    _reader: &mut FrameReader,
+    _reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<AuthorizationOutcome> {
     let Ok(connection) = Connection::system() else {
         return Ok(fingerprint_fallback(
@@ -500,7 +500,7 @@ fn authorization_pam(
     channel: Channel,
     uid: u32,
     child: &mut SystemdChild,
-    reader: &mut FrameReader,
+    reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<AuthorizationOutcome> {
     let (question_tx, question_rx) = mpsc::channel();
     let (answer_tx, answer_rx) = mpsc::channel();
@@ -557,7 +557,7 @@ fn authorization_pass(
     channel: Channel,
     uid: u32,
     child: &mut SystemdChild,
-    reader: &mut FrameReader,
+    reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<AuthorizationOutcome> {
     let username = username_from_uid(uid).ok_or(CtapStatus::OperationDenied)?;
 
@@ -624,7 +624,7 @@ fn try_ui_message(
     hid: &mut Ctaphid,
     channel: Channel,
     child: &mut SystemdChild,
-    reader: &mut FrameReader,
+    reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<Option<UIMessage>> {
     if try_recv_cancel(hid, channel)?.is_some() {
         // Dropping `child` kills the unit and reaps the process.

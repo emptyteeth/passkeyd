@@ -6,14 +6,20 @@ migrate:
     migration_success: "Старый passkey для сайта %{site}, связанный с учётной записью пользователя %{user_account}, был успешно перенесён."
 
 manager:
-  tui:
-    confirmation:
-      title: "Подтвердить это действие?"
-      description: "Вы уверены? Авторизуйте этот запрос, чтобы доказать, что вы не нажали клавишу удаления по ошибке."
-      button: "авторизовать"
-
   main:
-    root_access_required: "Вы запущены от root? Доступ к списку passkey требует привилегий root."
+    window_title: "Управление Passkeyd"
+    empty: "Ключи доступа не сохранены."
+    delete: "Удалить"
+    back: "< Назад"
+    no_account: "(нет учётной записи)"
+    root_access_required: "Вы запущены от root? Для доступа к списку passkey требуются права root."
+    unknown_owner: "uid %{uid}"
+    confirmation:
+      passkey: "Удалить ключ доступа для %{what}?"
+      site: "Удалить все ключи доступа для %{site}?"
+      note: "Это удалит его только с этой машины; на сайте копия останется."
+      cancel: "Отмена"
+      confirm: "Удалить"
 
 ui:
   enroll:

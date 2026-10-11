@@ -20,7 +20,7 @@ use std::process::ChildStdout;
 use ctap_types::serde::{cbor_deserialize, cbor_serialize_to};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::utils::{CborVec, UIMessage};
+use crate::utils::CborVec;
 
 /// Upper bound on a single frame. The initial UI state carries site/user icons,
 /// so this is generous on purpose; it exists to catch a desynchronised stream
@@ -79,20 +79,27 @@ where
 /// Holds a partial frame across calls so a payload split over several `write`s
 /// is reassembled correctly, which the previous byte-scanning implementation
 /// did not guarantee.
+///
+/// Generic over the payload so every UI conversation can use it, not just the
+/// passkey prompts.
 #[derive(Default)]
-pub struct FrameReader {
+pub struct FrameReader<T> {
     buffer: Vec<u8>,
+    _payload: std::marker::PhantomData<T>,
 }
 
-impl FrameReader {
+impl<T: DeserializeOwned> FrameReader<T> {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            buffer: Vec::new(),
+            _payload: std::marker::PhantomData,
+        }
     }
 
     /// Read one frame if the child has written a complete one.
     ///
     /// Never blocks: the caller is expected to have checked readability first.
-    pub fn poll(&mut self, stdout: &mut ChildStdout) -> io::Result<Option<UIMessage>> {
+    pub fn poll(&mut self, stdout: &mut ChildStdout) -> io::Result<Option<T>> {
         let mut scratch = [0u8; 4096];
         loop {
             // A previous read may already have left a whole frame in the
@@ -222,7 +229,7 @@ mod tests {
 
     #[test]
     fn pending_len_rejects_oversized_header() {
-        let mut reader = FrameReader::new();
+        let mut reader = FrameReader::<ServiceMessage>::new();
         reader
             .buffer
             .extend_from_slice(&((MAX_FRAME + 1) as u32).to_be_bytes());
@@ -235,7 +242,7 @@ mod tests {
 
     #[test]
     fn pending_len_waits_for_a_full_header() {
-        let mut reader = FrameReader::new();
+        let mut reader = FrameReader::<ServiceMessage>::new();
         reader.buffer.extend_from_slice(&[0, 0]);
         assert_eq!(reader.pending_len().unwrap(), None);
     }

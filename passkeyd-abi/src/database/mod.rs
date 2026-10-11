@@ -206,6 +206,34 @@ pub fn increment_sign_count(rp: PublicKeyCredentialRpEntity, mut passkey: Passke
     info!("Sign count has been updated");
 }
 
+/// Every relying party that has passkeys stored.
+///
+/// The manager needs this: deletions arrive by `rp_id`, and the flat store is
+/// keyed by a hash of it, so there is nothing to enumerate otherwise.
+pub fn all_relying_parties() -> Vec<PublicKeyCredentialRpEntity> {
+    let Ok(entries) = fs::read_dir(database_dir()) else {
+        return Vec::new();
+    };
+
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let metadata = entry.path().join("metadata");
+            let bytes = fs::read(metadata).ok()?;
+            cbor_deserialize(&bytes).ok()
+        })
+        .collect()
+}
+
+/// The relying party with this id, if it has passkeys stored.
+pub fn relying_party(rp_id: &str) -> Option<PublicKeyCredentialRpEntity> {
+    let hash = sha2::Sha256::digest(rp_id.as_bytes());
+    let path = database_dir().join(hex::encode(hash)).join("metadata");
+    let bytes = fs::read(path).ok()?;
+    cbor_deserialize(&bytes).ok()
+}
+
 fn cerdential_id_to_str(id: &[u8]) -> String {
     hex::encode(id)
 }

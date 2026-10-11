@@ -6,14 +6,20 @@ migrate:
     migration_success: "Old passkey for the website %{site} associated with user account %{user_account} has been migrated."
 
 manager:
-  tui:
-    confirmation:
-      title: "Confirm this action?"
-      description: "Are you sure? Authorize this request to prove you didn't press the delete key by accident."
-      button: "Authorize"
-
   main:
+    window_title: "Passkeyd Manager"
+    empty: "No passkeys stored."
+    delete: "Delete"
+    back: "< Back"
+    no_account: "(no account)"
     root_access_required: "Are you running as root? Accessing the passkey list requires root privileges."
+    unknown_owner: "uid %{uid}"
+    confirmation:
+      passkey: "Delete the passkey for %{what}?"
+      site: "Delete every passkey for %{site}?"
+      note: "This only removes it from this machine; the website keeps its copy."
+      cancel: "Cancel"
+      confirm: "Delete"
 
 ui:
   enroll:

@@ -6,13 +6,20 @@ migrate:
     migration_success: "网站 %{site} 上与用户账户 %{user_account} 关联的旧通行密钥已成功迁移。"
 
 manager:
-  tui:
-    confirmation:
-      title: "确认此操作？"
-      description: "你确定吗？授权此请求，以证明你不是误按删除键。"
-      button: "授权"
   main:
-    root_access_required: "你正在以 root 身份运行吗？访问密钥列表需要 root 权限。"
+    window_title: "Passkeyd 管理器"
+    empty: "尚未存储任何通行密钥。"
+    delete: "删除"
+    back: "< 返回"
+    no_account: "（无账户）"
+    root_access_required: "你是否以 root 身份运行？访问通行密钥列表需要 root 权限。"
+    unknown_owner: "uid %{uid}"
+    confirmation:
+      passkey: "删除 %{what} 的通行密钥？"
+      site: "删除 %{site} 的全部通行密钥？"
+      note: "这只会从本机移除，网站端仍保留副本。"
+      cancel: "取消"
+      confirm: "删除"
 
 ui:
   enroll:

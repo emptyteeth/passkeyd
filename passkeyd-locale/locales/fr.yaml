@@ -6,13 +6,20 @@ migrate:
     migration_success: "L’ancienne clé d’accès pour le site %{site}, associée au compte utilisateur %{user_account}, a été migrée."
 
 manager:
-  tui:
-    confirmation:
-      title: "Confirmer cette action ?"
-      description: "Êtes-vous sûr ? Autorisez cette demande pour prouver que vous n’avez pas appuyé sur la touche supprimer par accident."
-      button: "Autoriser"
   main:
-    root_access_required: "Êtes-vous en mode root ? L’accès à la liste des clés nécessite des privilèges root."
+    window_title: "Gestionnaire Passkeyd"
+    empty: "Aucune clé d’accès enregistrée."
+    delete: "Supprimer"
+    back: "< Retour"
+    no_account: "(aucun compte)"
+    root_access_required: "Êtes-vous root ? L’accès à la liste des clés d’accès nécessite les privilèges root."
+    unknown_owner: "uid %{uid}"
+    confirmation:
+      passkey: "Supprimer la clé d’accès de %{what} ?"
+      site: "Supprimer toutes les clés d’accès de %{site} ?"
+      note: "Cela ne la retire que de cette machine ; le site en conserve une copie."
+      cancel: "Annuler"
+      confirm: "Supprimer"
 
 ui:
   enroll:

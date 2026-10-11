@@ -6,14 +6,20 @@ migrate:
     migration_success: "Alter Passkey für die Website %{site}, der dem Benutzerkonto %{user_account} zugeordnet ist, wurde migriert."
     
 manager:
-  tui:
-    confirmation:
-      title: "Diese Aktion bestätigen?"
-      description: "Sind Sie sicher? Autorisieren Sie diese Anfrage, um zu beweisen, dass Sie die Löschtaste nicht versehentlich gedrückt haben."
-      button: "Autorisieren"
-
   main:
-    root_access_required: "Führen Sie das System als root aus? Der Zugriff auf die Passkey-Liste erfordert Root-Rechte."
+    window_title: "Passkeyd-Verwaltung"
+    empty: "Keine Passkeys gespeichert."
+    delete: "Löschen"
+    back: "< Zurück"
+    no_account: "(kein Konto)"
+    root_access_required: "Laufen Sie als root? Der Zugriff auf die Passkey-Liste erfordert root-Rechte."
+    unknown_owner: "uid %{uid}"
+    confirmation:
+      passkey: "Passkey für %{what} löschen?"
+      site: "Alle Passkeys für %{site} löschen?"
+      note: "Dies entfernt ihn nur von diesem Rechner; die Website behält ihre Kopie."
+      cancel: "Abbrechen"
+      confirm: "Löschen"
 
 ui:
   enroll:

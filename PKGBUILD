@@ -25,6 +25,7 @@ package() {
 # UI binary installation - ICE (Universal)
   install -Dm755 passkeyd-ice-enroll "$pkgdir/usr/lib/passkeyd/passkeyd-ice-enroll"
   install -Dm755 passkeyd-ice-select "$pkgdir/usr/lib/passkeyd/passkeyd-ice-select"
+  install -Dm755 passkeyd-ice-manager "$pkgdir/usr/lib/passkeyd/passkeyd-ice-manager"
   install -Dm755 passkeyd-ice-selection "$pkgdir/usr/lib/passkeyd/passkeyd-ice-selection"
 
   # UI binary installation - KDE

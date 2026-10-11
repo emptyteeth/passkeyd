@@ -22,6 +22,7 @@ pub struct Config {
     pub front_enroll: String,
     pub front_select: String,
     pub front_selection: String,
+    pub front_manager: String,
     pub use_tpm_cryptography: bool,
     pub no_pass: bool,
     pub lang: Option<String>,
@@ -87,6 +88,11 @@ impl Config {
             .unwrap_or(&"/usr/lib/passkeyd/passkeyd-selection".to_string())
             .to_owned();
 
+        let front_manager = config
+            .get("FRONT_MANAGER")
+            .unwrap_or(&"/usr/lib/passkeyd/passkeyd-ice-manager".to_string())
+            .to_owned();
+
         let lang = config.get("LANGUAGE").map(String::to_owned);
         let use_tpm_cryptography = config
             .get("USE_TPM_CRYPTOGRAPHY")
@@ -116,6 +122,7 @@ impl Config {
             front_enroll,
             front_select,
             front_selection,
+            front_manager,
             use_tpm_cryptography,
             auth,
         })

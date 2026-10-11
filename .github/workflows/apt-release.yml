@@ -134,6 +134,7 @@ jobs:
             # UI binary installation
             install -Dm755 passkeyd-ice-enroll debian/passkeyd/usr/lib/passkeyd/passkeyd-ice-enroll
             install -Dm755 passkeyd-ice-select debian/passkeyd/usr/lib/passkeyd/passkeyd-ice-select
+            install -Dm755 passkeyd-ice-manager debian/passkeyd/usr/lib/passkeyd/passkeyd-ice-manager
             install -Dm755 passkeyd-ice-selection debian/passkeyd/usr/lib/passkeyd/passkeyd-ice-selection
 
             install -Dm755 passkeyd-kde-enroll debian/passkeyd/usr/lib/passkeyd/passkeyd-kde-enroll

@@ -128,6 +128,9 @@ pub enum UI {
     KeyEnroll,
     KeySelect,
     KeySelection,
+    /// The passkey manager's window. Unlike the others it is long-lived and
+    /// talks back and forth, listing and deleting.
+    KeyManager,
 }
 
 impl UI {
@@ -146,6 +149,7 @@ impl UI {
                 UI::KeyEnroll => format!("{target_dir}/{}", "passkeyd-ice-enroll"),
                 UI::KeySelect => format!("{target_dir}/{}", "passkeyd-ice-select"),
                 UI::KeySelection => format!("{target_dir}/{}", "passkeyd-ice-selection"),
+                UI::KeyManager => format!("{target_dir}/{}", "passkeyd-ice-manager"),
             }
         }
 
@@ -155,6 +159,7 @@ impl UI {
                 UI::KeyEnroll => config.front_enroll.to_owned(),
                 UI::KeySelect => config.front_select.to_owned(),
                 UI::KeySelection => config.front_selection.to_owned(),
+                UI::KeyManager => config.front_manager.to_owned(),
             }
         }
     }
@@ -170,7 +175,9 @@ pub struct SystemdChild {
 }
 
 impl SystemdChild {
-    pub fn send(&mut self, message: &ServiceMessage) -> anyhow::Result<()> {
+    /// Send anything serializable. Generic so the manager's conversation can
+    /// use it too, not just the passkey prompts' `ServiceMessage`.
+    pub fn send<M: Serialize>(&mut self, message: &M) -> anyhow::Result<()> {
         crate::framing::write_frame(&mut self.stdin, message).map_err(Into::into)
     }
 
@@ -300,6 +307,47 @@ pub struct SelectUI<'a> {
     pub no_pass: bool,
     /// Which verification screen the UI should present.
     pub auth: crate::config::Auth,
+}
+
+/// One entry in the manager's list, and everything the GUI needs to show it.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ManagerEntry {
+    /// The relying party this credential belongs to.
+    pub rp: PublicKeyCredentialRpEntity,
+    pub credential_id: Vec<u8>,
+    /// Site account name, if the passkey carries one.
+    pub account: Option<String>,
+    /// Login name of the owner, already resolved: the GUI runs unprivileged and
+    /// cannot look up other users.
+    pub owner: Option<String>,
+    pub uid: u32,
+}
+
+/// The manager's whole state, sent to the GUI on start-up.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ManagerUI {
+    pub entries: Vec<ManagerEntry>,
+}
+
+/// What the GUI asks the root side to do. Deleting needs root, so it has to
+/// come back over the pipe.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub enum ManagerRequest {
+    /// Remove one passkey, by credential id.
+    DeletePasskey { credential_id: Vec<u8> },
+    /// Remove every passkey for a site.
+    DeleteSite { rp_id: String },
+    /// The user closed the window; the root side can stop waiting.
+    Quit,
+}
+
+/// What the root side reports back.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub enum ManagerReply {
+    /// The list changed; the GUI should redraw from this.
+    Refreshed(ManagerUI),
+    /// Something went wrong, for display.
+    Failed(String),
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

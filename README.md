@@ -80,30 +80,18 @@ The configuration for the Ice user interface can be found at `/usr/share/passkey
 
 ## Passkeyd Manager
 
-To manage your passkeys, Enter the command `passkeyd-manager`.
+To manage your passkeys, run `sudo passkeyd-manager`. It needs root because the
+store is root-only, and it opens a window in the active user's session — the
+list is read and deletions performed by the root side, which talks to the
+window over a private pipe.
 
-<table class="desktop-only">
-  <thead>
-    <tr>
-      <th width="25%">Keys</th>
-      <th width="75%">Action</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><kbd>Enter</kbd> or <kbd>Esc</kbd></td>
-      <td>View the selected site’s passkey. Press again to go back.</td>
-    </tr>
-    <tr>
-      <td><kbd>Delete</kbd></td>
-      <td>If a website is selected, deletes all its passkeys. If a specific passkey is selected, deletes only that entry. This only removes it from the system, not from the website. You may still need to remove it from the website separately.</td>
-    </tr>
-    <tr>
-      <td><kbd>Ctrl</kbd> + <kbd>C</kbd></td>
-      <td>Exit.</td>
-    </tr>
-  </tbody>
-</table>
+Click a site to see its passkeys, then **Delete** to remove either a single
+passkey or the whole site. Each passkey shows its owner, since the store is
+shared between users. A passkey marked *unowned* predates per-user ownership;
+run `passkeyd-migrate` to assign it.
+
+Deleting only removes it from this system, not from the website. You may still
+need to remove it from the website separately.
 
 ### Contrubution
 
