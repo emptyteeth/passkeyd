@@ -486,19 +486,19 @@ fn authorization_fprint(
 fn authorization_pam(
     hid: &mut Ctaphid,
     channel: Channel,
-    _config: &Config,
+    config: &Config,
     child: &mut SystemdChild,
     reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
-    // let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
-
     let (question_tx, question_rx) = mpsc::channel();
     let (answer_tx, answer_rx) = mpsc::channel();
     let (pam_result_tx, pam_result_rx) = mpsc::channel();
 
     let conv = InteractiveConversation {
-        answer_rx: answer_rx,
-        question_tx: question_tx,
+        answer_rx,
+        question_tx,
+        // Answer PAM's username prompt ourselves: the account is already known.
+        username: get_username_from_uid(config.gui_uid),
     };
 
     let Ok(mut client) = pam::Client::with_conversation("passkeyd", conv) else {
