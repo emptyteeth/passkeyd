@@ -21,7 +21,7 @@ use zbus::blocking::Connection;
 
 use crate::auth::fprintd::{FprintDeviceProxyBlocking, FprintManagerProxyBlocking};
 use crate::auth::pam::InteractiveConversation;
-use crate::auth::pass::verify_password;
+use crate::auth::pass::{PasswordCheck, check_password};
 use crate::cryptography;
 use crate::ctaphid::ctaphid::Ctaphid;
 use crate::ctaphid::{CtapStatus, TransportError};
@@ -548,19 +548,32 @@ fn authorization_pass(
     reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
     let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
-    const MAX_ATTEMPTS: usize = 3;
-    let mut attempts = 0;
 
     loop {
         if let Some(UIMessage::Password(pass)) = try_ui_message(hid, channel, child, reader)? {
-            if verify_password(&username, &pass)? {
-                return Ok(AuthorizationOutcome::Authorized);
+            match check_password(&username, &pass) {
+                PasswordCheck::Verified => return Ok(AuthorizationOutcome::Authorized),
+
+                // The lockout is enforced across requests, so a run of wrong
+                // guesses ends the attempt here rather than letting the caller
+                // start a fresh assertion with a fresh budget.
+                PasswordCheck::LockedOut { retry_after } => {
+                    info!(
+                        "[Password] {username} is locked out for another {}s",
+                        retry_after.as_secs()
+                    );
+                    return Ok(AuthorizationOutcome::UnAuthorized);
+                }
+
+                // Retrying cannot fix an expired or locked account, so stop
+                // rather than let the user keep typing.
+                PasswordCheck::Unusable(reason) => {
+                    info!("[Password] refusing {username}: {reason}");
+                    return Ok(AuthorizationOutcome::UnAuthorized);
+                }
+
+                PasswordCheck::Rejected => child.send(&ServiceMessage::Retry)?,
             }
-            attempts += 1;
-            if attempts >= MAX_ATTEMPTS {
-                return Ok(AuthorizationOutcome::UnAuthorized);
-            }
-            child.send(&ServiceMessage::Retry)?;
         };
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
