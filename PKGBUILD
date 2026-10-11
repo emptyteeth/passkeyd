@@ -28,15 +28,7 @@ package() {
   install -Dm755 passkeyd-ice-manager "$pkgdir/usr/lib/passkeyd/passkeyd-ice-manager"
   install -Dm755 passkeyd-ice-selection "$pkgdir/usr/lib/passkeyd/passkeyd-ice-selection"
 
-  # UI binary installation - KDE
-  install -Dm755 passkeyd-kde-enroll "$pkgdir/usr/lib/passkeyd/passkeyd-kde-enroll"
-  install -Dm755 passkeyd-kde-select "$pkgdir/usr/lib/passkeyd/passkeyd-kde-select"
-  install -Dm755 passkeyd-kde-selection "$pkgdir/usr/lib/passkeyd/passkeyd-kde-selection"
 
-  # UI binary installation - GTK
-  install -Dm755 passkeyd-gtk-enroll "$pkgdir/usr/lib/passkeyd/passkeyd-gtk-enroll"
-  install -Dm755 passkeyd-gtk-select "$pkgdir/usr/lib/passkeyd/passkeyd-gtk-select"
-  install -Dm755 passkeyd-gtk-selection "$pkgdir/usr/lib/passkeyd/passkeyd-gtk-selection"
 
   # Database directory
   install -d -m 700 -o root -g root "$pkgdir/var/lib/passkeyd/database"

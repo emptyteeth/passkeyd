@@ -76,7 +76,7 @@ To determine whether the passkey is working properly, you may follow this step.
 
 ## Passkeyd UI Custom Theme
 
-The configuration for the Ice user interface can be found at `/usr/share/passkeyd/theme.conf`. KDE and GTK user interfaces can also be configured through your system settings. If you need complete control over the user interface, you can build your own as well.
+The configuration for the user interface can be found at `/usr/share/passkeyd/theme.conf`. If you need complete control over it, you can build your own front-end as well — see [`passkeyd-ui`](passkeyd-ui/README.md).
 
 ## Passkeyd Manager
 

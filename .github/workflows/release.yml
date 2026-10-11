@@ -20,7 +20,7 @@ jobs:
 
       - name: Install sys dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y clang llvm-dev libudev-dev libclang-dev libpam0g-dev libtss2-dev gh libglib2.0-dev pkg-config cmake libgtk-4-dev qt6-base-dev qt6-declarative-dev lld
+          sudo apt-get update && sudo apt-get install -y clang llvm-dev libudev-dev libclang-dev libpam0g-dev libtss2-dev gh libglib2.0-dev pkg-config cmake lld
 
       - name: Compile
         run: cargo build --release --target x86_64-unknown-linux-gnu
@@ -30,8 +30,6 @@ jobs:
           tar czf passkeyd-x86_64-unknown-linux-gnu.tar.gz \
             -C target/x86_64-unknown-linux-gnu/release passkeyd passkeyd-manager passkeyd-migrate \
             passkeyd-ice-enroll passkeyd-ice-select passkeyd-ice-selection passkeyd-ice-manager \
-            passkeyd-kde-enroll passkeyd-kde-select passkeyd-kde-selection \
-            passkeyd-gtk-enroll passkeyd-gtk-select passkeyd-gtk-selection \
             -C $GITHUB_WORKSPACE passkeyd.service passkeyd.conf passkeyd.pam icons theme.conf
       - name: Create GitHub Release
         run: |

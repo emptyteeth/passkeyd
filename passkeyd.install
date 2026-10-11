@@ -1,25 +1,10 @@
 post_install() {
     exec > /dev/tty
-    echo -e "\e[1m==> \e[36mSelect your preferred passkeyd user interface:\e[0m"
-    echo -e "    \e[1m\e[34m1) ice\e[0m (Universal - works on any desktop)"
-    echo -e "    \e[1m\e[36m2) kde\e[0m (Native KDE Plasma)"
-    echo -e "    \e[1m\e[32m3) gtk\e[0m (Native GTK)"
-    printf "\e[1m==> \e[0mEnter your choice [1-3] (default: 1): "
-    read -r choice < /dev/tty
+    ui="ice"
 
-    case "$choice" in
-        2) ui="kde" ;;
-        3) ui="gtk" ;;
-        *) ui="ice" ;;
-    esac
+    _configure_front_ends "ice"
 
-    if [ -f /etc/passkeyd.conf ]; then
-        sed -i "s|FRONT_ENROLL=.*|FRONT_ENROLL=/usr/lib/passkeyd/passkeyd-${ui}-enroll|" /etc/passkeyd.conf
-        sed -i "s|FRONT_SELECT=.*|FRONT_SELECT=/usr/lib/passkeyd/passkeyd-${ui}-select|" /etc/passkeyd.conf
-        sed -i "s|FRONT_SELECTION=.*|FRONT_SELECTION=/usr/lib/passkeyd/passkeyd-${ui}-selection|" /etc/passkeyd.conf
-    fi
-
-    echo -e "\e[1m==> \e[32mConfigured passkeyd to use the '${ui}' user interface.\e[0m"
+    echo -e "\e[1m==> \e[32mConfigured passkeyd to use the 'ice' user interface.\e[0m"
     echo -e "\e[1m==> \e[0mThis user interface can be changed via config \e[1;31m/etc/passkeyd.conf\e[0m"
 
     _send_telemetry "passkeyd_installed" "$ui"
@@ -28,19 +13,15 @@ post_install() {
 post_upgrade() {
     exec > /dev/tty
     echo -e "\e[1m==> \e[32mpasskeyd has been upgraded.\e[0m\n"
-    echo "==> Would you like to switch your user interface?"
-    echo -e "    \e[1m\e[34m1) ice\e[0m (Universal - works on any desktop)"
-    echo -e "    \e[1m\e[36m2) kde\e[0m (Native KDE Plasma)"
-    echo -e "    \e[1m\e[32m3) gtk\e[0m (Native GTK)"
-    echo "    4) Manually upgrade configuration"
-    printf "==> Enter your choice [1-4] (default: 4): "
+    echo "==> Refresh the configured user interface paths?"
+    echo "    1) Yes (default)"
+    echo "    2) Manually upgrade configuration"
+    printf "==> Enter your choice [1-2] (default: 1): "
     read -r choice < /dev/tty
 
     case "$choice" in
-        1) ui="ice" ;;
-        2) ui="kde" ;;
-        3) ui="gtk" ;;
-        *) ui="" ;;
+        2) ui="" ;;
+        *) ui="ice" ;;
     esac
 
     local target_file="/usr/lib/passkeyd/passkeyd-ice-enroll"
@@ -64,12 +45,8 @@ post_upgrade() {
     fi
 
     if [ -n "$ui" ] && [ "$ui" != "unknown" ]; then
-        if [ -f /etc/passkeyd.conf ]; then
-            sed -i "s|FRONT_ENROLL=.*|FRONT_ENROLL=/usr/lib/passkeyd/passkeyd-${ui}-enroll|" /etc/passkeyd.conf
-            sed -i "s|FRONT_SELECT=.*|FRONT_SELECT=/usr/lib/passkeyd/passkeyd-${ui}-select|" /etc/passkeyd.conf
-            sed -i "s|FRONT_SELECTION=.*|FRONT_SELECTION=/usr/lib/passkeyd/passkeyd-${ui}-selection|" /etc/passkeyd.conf
-        fi
-        echo -e "\e[1m==> \e[32mSwitched passkeyd user interface to '${ui}'.\e[0m"
+        _configure_front_ends "$ui"
+        echo -e "\e[1m==> \e[32mRefreshed the passkeyd user interface paths.\e[0m"
     else
         echo -e "\e[1m==> \e[33mSkipping automatic configuration update.\e[0m"
         echo -e "\e[1m==> \e[0mNote: Binary names have changed upstream:"
@@ -80,6 +57,30 @@ post_upgrade() {
     fi
 
     _send_telemetry "passkeyd_upgraded" "$ui" "$days_since" "$install_date"
+}
+
+# Point every front-end at the given prefix. FRONT_MANAGER is included
+# because a config written before the manager existed has no such key at all.
+_configure_front_ends() {
+    local ui="$1"
+    [ -f /etc/passkeyd.conf ] || return 0
+
+    for front in enroll select selection manager; do
+        local key value
+        if [ "$front" = "manager" ]; then
+            key="FRONT_MANAGER"
+            value="/usr/lib/passkeyd/passkeyd-${ui}-manager"
+        else
+            key="FRONT_$(echo "$front" | tr '[:lower:]' '[:upper:]')"
+            value="/usr/lib/passkeyd/passkeyd-${ui}-${front}"
+        fi
+
+        if grep -q "^${key}=" /etc/passkeyd.conf; then
+            sed -i "s|^${key}=.*|${key}=${value}|" /etc/passkeyd.conf
+        else
+            echo "${key}=${value}" >> /etc/passkeyd.conf
+        fi
+    done
 }
 
 _send_telemetry() {
