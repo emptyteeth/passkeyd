@@ -115,7 +115,11 @@ mod tests {
     use passkeyd_abi::framing::write_frame;
     use std::{env, path::PathBuf, process::Stdio};
 
+    // Drives the real binary under systemd-run, so it needs an interactive
+    // desktop session with GUI_UID's display. It cannot pass from a plain
+    // shell, which is why it is ignored by default.
     #[test]
+    #[ignore = "interactive: needs a desktop session for the UI to draw in"]
     fn test_enrollment_process() {
         let authorization_ui = AuthorizationUI {
             title: "Passkey selection".into(),

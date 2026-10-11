@@ -4,6 +4,7 @@ use std::fs;
 
 use ctap_types::serde::cbor_deserialize;
 use ctap_types::webauthn::PublicKeyCredentialRpEntity;
+use passkeyd_abi::config;
 use passkeyd_abi::cryptography::CryptoPair;
 use passkeyd_abi::database::layout;
 
@@ -12,6 +13,21 @@ use crate::old_layout::{Passkey, StoredPasskey};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     passkeyd_locale::init_translations();
+
+    // Passkeys from the old layout have no owner. They belong to whoever the
+    // machine was configured for, which is what GUI_UID named.
+    let legacy_uid = config::legacy_gui_uid().ok_or(
+        "no GUI_UID in /etc/passkeyd.conf: cannot tell who the existing passkeys belong to",
+    )?;
+    println!("Assigning existing passkeys to uid {legacy_uid} (from GUI_UID)");
+
+    // Passkeys written by a version that had the current layout but no
+    // ownership. Safe to run on every upgrade: it only touches ownerless ones.
+    let claimed = passkeyd_abi::database::assign_legacy_uid(legacy_uid);
+    if claimed > 0 {
+        println!("Claimed {claimed} passkey(s) written before ownership existed");
+    }
+
     let db_path = database_dir();
     if !db_path.exists() {
         eprintln!(
@@ -98,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 sign_count: old_passkey_model.sign_count,
                 credential_type: layout::CredentialType::PublicKey,
+                uid: legacy_uid,
             };
 
             let rp_id = new_passkey_model.credential_source.rp_id.clone();

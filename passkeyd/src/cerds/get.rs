@@ -1,4 +1,3 @@
-use std::mem::MaybeUninit;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
@@ -13,6 +12,7 @@ use sha2::Digest;
 use passkeyd_abi::config::{Auth, Config};
 use passkeyd_abi::database::{get_passkeys, layout::Passkey};
 use passkeyd_abi::framing::FrameReader;
+use passkeyd_abi::session::{active_uid, username_from_uid};
 use passkeyd_abi::utils::{
     FallbackToPasswordReason, PresenceUI, Readiness, SelectUI, ServiceMessage, SystemdChild, UI,
     UIMessage, spawn_ui,
@@ -33,9 +33,13 @@ pub fn get(
     config: &Config,
     req: Request,
 ) -> anyhow::Result<Response> {
-    let (rp_entity, mut passkeys) = load_passkeys(&req)?;
+    // Who is asking. Everything below is scoped to them: only their passkeys
+    // are loaded, and only their credentials can authorize.
+    let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
+
+    let (rp_entity, mut passkeys) = load_passkeys(&req, uid)?;
     let action = authorization_action(has_another_fido_device(), config.no_pass, passkeys.len());
-    let authorized_index = authorize(hid, channel, config, &rp_entity, &passkeys, action)?;
+    let authorized_index = authorize(hid, channel, config, uid, &rp_entity, &passkeys, action)?;
     let authorized_passkey = passkeys.swap_remove(authorized_index);
 
     let rp_id_hash = sha2::Sha256::digest(req.rp_id.as_bytes()).into();
@@ -89,7 +93,10 @@ pub fn get(
     Ok(response)
 }
 
-fn load_passkeys(req: &Request) -> anyhow::Result<(PublicKeyCredentialRpEntity, Vec<Passkey>)> {
+fn load_passkeys(
+    req: &Request,
+    uid: u32,
+) -> anyhow::Result<(PublicKeyCredentialRpEntity, Vec<Passkey>)> {
     // Mock PublicKeyCredentialRpEntity, will be overriden by the
     // actual stored RP entity if one exists.
     let mut rp_entity = PublicKeyCredentialRpEntity {
@@ -103,7 +110,7 @@ fn load_passkeys(req: &Request) -> anyhow::Result<(PublicKeyCredentialRpEntity, 
     match &req.allow_list {
         Some(allow_cred) if !allow_cred.is_empty() => {
             for cred in allow_cred {
-                if let Some((rp, passkey)) = Passkey::get(&rp_entity, cred.id) {
+                if let Some((rp, passkey)) = Passkey::get(&rp_entity, cred.id, uid) {
                     rp_entity = rp;
                     passkeys.push(passkey)
                 }
@@ -111,7 +118,7 @@ fn load_passkeys(req: &Request) -> anyhow::Result<(PublicKeyCredentialRpEntity, 
         }
 
         Some(_) | None => {
-            if let Some((rp, stored_passkeys)) = get_passkeys(&rp_entity) {
+            if let Some((rp, stored_passkeys)) = get_passkeys(&rp_entity, uid) {
                 rp_entity = rp;
                 passkeys.extend(stored_passkeys);
             }
@@ -186,6 +193,7 @@ fn authorize(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
     rp_entity: &PublicKeyCredentialRpEntity,
     passkeys: &[Passkey],
     action: AuthorizationAction,
@@ -200,10 +208,10 @@ fn authorize(
             Ok(0)
         }
 
-        AuthorizationAction::Presence => authorize_presence(hid, channel, config, passkeys),
+        AuthorizationAction::Presence => authorize_presence(hid, channel, config, uid, passkeys),
 
         AuthorizationAction::Selection => {
-            authorize_selection(hid, channel, config, rp_entity, passkeys)
+            authorize_selection(hid, channel, config, uid, rp_entity, passkeys)
         }
     }
 }
@@ -212,6 +220,7 @@ fn authorize_presence(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
     passkeys: &[Passkey],
 ) -> anyhow::Result<usize> {
     let ui_data = PresenceUI {
@@ -220,7 +229,7 @@ fn authorize_presence(
         button: &passkeyd_locale::translate!("passkeyd.cerds.make.presence_ui.button"),
     };
 
-    let approved = cancellable_ui(hid, channel, spawn_ui(config, UI::KeySelection, ui_data))?
+    let approved = cancellable_ui(hid, channel, spawn_ui(config, UI::KeySelection, ui_data, uid))?
         .exit_status
         .success();
 
@@ -239,6 +248,7 @@ fn authorize_selection(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
     rp_entity: &PublicKeyCredentialRpEntity,
     passkeys: &[Passkey],
 ) -> anyhow::Result<usize> {
@@ -258,7 +268,7 @@ fn authorize_selection(
         auth: config.auth,
     };
 
-    authenticate_handler(hid, channel, config, ui_state)
+    authenticate_handler(hid, channel, config, uid, ui_state)
 }
 
 #[derive(Debug)]
@@ -276,9 +286,10 @@ fn authenticate_handler(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
     ui_state: SelectUI,
 ) -> anyhow::Result<usize> {
-    let mut child = spawn_ui(config, UI::KeySelect, ui_state);
+    let mut child = spawn_ui(config, UI::KeySelect, ui_state, uid);
     let mut reader = FrameReader::new();
 
     loop {
@@ -286,7 +297,7 @@ fn authenticate_handler(
             match event {
                 UIMessage::SelectionDoneMaybeStartAuth(i) => {
                     if !config.no_pass {
-                        authorization(hid, channel, config, &mut child, &mut reader)?;
+                        authorization(hid, channel, config, uid, &mut child, &mut reader)?;
                     } else {
                         // Nothing further is expected from the UI; let it close
                         // itself rather than killing it mid-render.
@@ -307,15 +318,16 @@ fn authorization(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
     child: &mut SystemdChild,
     reader: &mut FrameReader,
 ) -> anyhow::Result<()> {
     let mut auth = &config.auth;
     loop {
         let auth_outcome = match auth {
-            Auth::PASS => authorization_pass(hid, channel, config, child, reader),
-            Auth::FPRINT => authorization_fprint(hid, channel, config, child, reader),
-            Auth::PAM => authorization_pam(hid, channel, config, child, reader),
+            Auth::PASS => authorization_pass(hid, channel, uid, child, reader),
+            Auth::FPRINT => authorization_fprint(hid, channel, uid, child, reader),
+            Auth::PAM => authorization_pam(hid, channel, uid, child, reader),
         };
 
         // The UI owns the final "granted"/"denied" signal, so tell it how the
@@ -358,7 +370,7 @@ fn fingerprint_fallback(context: &str, error: impl std::fmt::Display) -> Authori
 fn authorization_fprint(
     hid: &mut Ctaphid,
     channel: Channel,
-    config: &Config,
+    uid: u32,
     child: &mut SystemdChild,
     _reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
@@ -387,7 +399,7 @@ fn authorization_fprint(
         ));
     };
 
-    let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
+    let username = username_from_uid(uid).ok_or(CtapStatus::OperationDenied)?;
     let enrolled = match fprint_device.list_enrolled_fingers(&username) {
         Ok(enrolled) => enrolled,
         Err(error) => {
@@ -486,7 +498,7 @@ fn authorization_fprint(
 fn authorization_pam(
     hid: &mut Ctaphid,
     channel: Channel,
-    config: &Config,
+    uid: u32,
     child: &mut SystemdChild,
     reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
@@ -498,7 +510,7 @@ fn authorization_pam(
         answer_rx,
         question_tx,
         // Answer PAM's username prompt ourselves: the account is already known.
-        username: get_username_from_uid(config.gui_uid),
+        username: username_from_uid(uid),
     };
 
     let Ok(mut client) = pam::Client::with_conversation("passkeyd", conv) else {
@@ -543,11 +555,11 @@ fn authorization_pam(
 fn authorization_pass(
     hid: &mut Ctaphid,
     channel: Channel,
-    config: &Config,
+    uid: u32,
     child: &mut SystemdChild,
     reader: &mut FrameReader,
 ) -> anyhow::Result<AuthorizationOutcome> {
-    let username = get_username_from_uid(config.gui_uid).ok_or(CtapStatus::OperationDenied)?;
+    let username = username_from_uid(uid).ok_or(CtapStatus::OperationDenied)?;
 
     loop {
         if let Some(UIMessage::Password(pass)) = try_ui_message(hid, channel, child, reader)? {
@@ -645,26 +657,3 @@ fn try_ui_message(
     Ok(None)
 }
 
-fn get_username_from_uid(uid: libc::uid_t) -> Option<String> {
-    let mut passwd = MaybeUninit::uninit();
-    let mut buff = vec![0; size_of::<libc::passwd>()];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    while unsafe {
-        libc::getpwuid_r(
-            uid,
-            passwd.as_mut_ptr(),
-            buff.as_mut_ptr(),
-            buff.len(),
-            &mut result as _,
-        )
-    } == libc::ERANGE
-    {
-        buff.resize(buff.len() * 2, 0);
-    }
-    if result.is_null() {
-        return None;
-    };
-    let passwd = unsafe { passwd.assume_init() };
-    let cstr = unsafe { std::ffi::CStr::from_ptr(passwd.pw_name) };
-    cstr.to_str().ok().map(|username| username.to_string())
-}

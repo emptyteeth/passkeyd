@@ -2,7 +2,8 @@ use std::{fs, io};
 
 use ctap_types::{serde::cbor_deserialize, webauthn::PublicKeyCredentialRpEntity};
 use passkeyd_abi::database::database_dir;
-use passkeyd_abi::database::layout::{Passkey, StoreablePasskey};
+use passkeyd_abi::database::layout::{self, Passkey, StoreablePasskey};
+use passkeyd_abi::session;
 use ratatui::{text::Text, widgets::ListState};
 
 struct Database {
@@ -200,20 +201,29 @@ impl ListStateExt {
                         .passkeys
                         .iter()
                         .map(|passkey| {
-                            if let Some(name) = &passkey.credential_source.other_ui.user.name {
-                                Text::from(name.to_string())
-                            } else if let Some(dname) =
-                                &passkey.credential_source.other_ui.user.display_name
-                            {
-                                Text::from(dname.to_string())
-                            } else {
-                                Text::from(
+                            let account =
+                                if let Some(name) = &passkey.credential_source.other_ui.user.name {
+                                    name.to_string()
+                                } else if let Some(dname) =
+                                    &passkey.credential_source.other_ui.user.display_name
+                                {
+                                    dname.to_string()
+                                } else {
                                     String::from_utf8_lossy(
                                         passkey.credential_source.other_ui.user.id.as_slice(),
                                     )
-                                    .into_owned(),
-                                )
-                            }
+                                    .into_owned()
+                                };
+
+                            // The store is shared across users, so say whose
+                            // passkey this is. An ownerless one is left over
+                            // from before ownership existed.
+                            let owner = match passkey.uid {
+                                layout::LEGACY_UID => "unowned".to_string(),
+                                uid => session::username_from_uid(uid)
+                                    .unwrap_or_else(|| format!("uid {uid}")),
+                            };
+                            Text::from(format!("{account}  [{owner}]"))
                         })
                         .collect::<Vec<_>>();
                 }

@@ -18,7 +18,6 @@ pub enum Auth {
 
 #[derive(Debug)]
 pub struct Config {
-    pub gui_uid: u32, // UID to create a under privilege child, to prevent GUI from running as root
     pub rust_log: String,
     pub front_enroll: String,
     pub front_select: String,
@@ -30,6 +29,25 @@ pub struct Config {
 }
 
 const PASSKEY_CONFIG_PATH: &str = "/etc/passkeyd.conf";
+
+/// The `GUI_UID` from a pre-multi-user configuration.
+///
+/// `Config` no longer carries this — the active session decides whose window
+/// to show — but `passkeyd-migrate` needs it once, to work out who owns the
+/// passkeys that predate ownership. Reading it here keeps that knowledge out
+/// of the running daemon's configuration.
+pub fn legacy_gui_uid() -> Option<u32> {
+    let content = fs::read_to_string(PASSKEY_CONFIG_PATH).ok()?;
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("");
+            let mut parts = line.splitn(2, '=');
+            Some((parts.next()?.trim(), parts.next()?.trim()))
+        })
+        .find(|(key, _)| *key == "GUI_UID")
+        .and_then(|(_, value)| value.parse().ok())
+}
 
 impl Config {
     pub fn initialize() -> anyhow::Result<Config> {
@@ -47,10 +65,6 @@ impl Config {
             })
             .collect::<HashMap<String, String>>();
 
-        let gui_uid = config
-            .get("GUI_UID")
-            .unwrap_or(&"1000".to_string())
-            .parse()?;
         let rust_log = config
             .get("RUST_LOG")
             .unwrap_or(&if cfg!(debug_assertions) {
@@ -98,7 +112,6 @@ impl Config {
         Ok(Config {
             lang,
             no_pass,
-            gui_uid,
             rust_log,
             front_enroll,
             front_select,

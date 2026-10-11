@@ -23,6 +23,7 @@ use passkeyd_abi::config::Config;
 use passkeyd_abi::cryptography::CryptoBackend;
 use passkeyd_abi::cryptography::CryptoPair;
 use passkeyd_abi::database;
+use passkeyd_abi::session::active_uid;
 use passkeyd_abi::database::layout::Passkey;
 use passkeyd_abi::utils::Cose;
 use passkeyd_abi::utils::EnrollUI;
@@ -40,12 +41,15 @@ pub fn make(
     config: &Config,
     req: Request,
 ) -> anyhow::Result<Response> {
-    check_excluded_credential(hid, channel, config, &req)?;
+    // New passkeys are owned by whoever is at the console.
+    let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
+
+    check_excluded_credential(hid, channel, config, uid, &req)?;
 
     let mut crypto = cryptography::resolve_cryptography(config);
     let (crypto_pair, credential_public_key) = generate_credentials(crypto.as_mut(), &req)?;
     debug!("Generated wrapped private and public keys");
-    let passkey = Passkey::new(req.rp.id.clone(), req.user.clone(), crypto_pair);
+    let passkey = Passkey::new(req.rp.id.clone(), req.user.clone(), crypto_pair, uid);
 
     let attested_credential = AttestedCredentialData {
         aaguid: &[0u8; 16],
@@ -119,7 +123,7 @@ pub fn make(
     let is_selection_req = matches!(req.rp.id.as_str(), ".dummy" | "make.me.blink");
 
     let status = if is_selection_req {
-        request_selection(hid, channel, config)?
+        request_selection(hid, channel, config, uid)?
     } else {
         cancellable_ui(
             hid,
@@ -131,6 +135,7 @@ pub fn make(
                     rp: &req.rp,
                     other_ui: &passkey.credential_source.other_ui,
                 },
+                uid,
             ),
         )?
         .exit_status
@@ -152,13 +157,16 @@ fn check_excluded_credential(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
     req: &Request,
 ) -> anyhow::Result<()> {
     let Some(exclude_list) = &req.exclude_list else {
         return Ok(());
     };
 
-    let Some((_, passkeys)) = database::get_passkeys(&req.rp) else {
+    // Only this user's passkeys can exclude the request: another user's
+    // credential on the same site is not a reason to refuse.
+    let Some((_, passkeys)) = database::get_passkeys(&req.rp, uid) else {
         return Ok(());
     };
 
@@ -174,7 +182,7 @@ fn check_excluded_credential(
 
     // If another authenticator is present, ask the user persence
     if has_another_fido_device() {
-        request_selection(hid, channel, config)?;
+        request_selection(hid, channel, config, uid)?;
 
         info!("Excluded credential detected");
     }
@@ -186,6 +194,7 @@ fn request_selection(
     hid: &mut Ctaphid,
     channel: Channel,
     config: &Config,
+    uid: u32,
 ) -> anyhow::Result<ExitStatus> {
     Ok(cancellable_ui(
         hid,
@@ -200,6 +209,7 @@ fn request_selection(
                 ),
                 button: &passkeyd_locale::translate!("passkeyd.cerds.make.presence_ui.button"),
             },
+            uid,
         ),
     )?
     .exit_status)

@@ -94,10 +94,17 @@ impl App {
                             button: passkeyd_locale::translate!("manager.tui.confirmation.button")
                                 .into(),
                         };
+                        // Show the prompt to whoever is at the console. If
+                        // nobody is, there is no one to confirm with.
+                        let Some(uid) = passkeyd_abi::session::active_uid() else {
+                            self.exit = true;
+                            return Ok(());
+                        };
                         let res = spawn_ui(
                             &self.config,
                             passkeyd_abi::utils::UI::KeySelection,
                             confirmation,
+                            uid,
                         )
                         .inner
                         .wait()

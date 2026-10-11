@@ -1,6 +1,7 @@
 use ctaphid_types::{Channel, Command};
 use passkeyd_abi::{
     config::Config,
+    session::active_uid,
     utils::{PresenceUI, UI, spawn_ui},
 };
 
@@ -10,6 +11,12 @@ use crate::{
 };
 
 pub fn handle(hid: &mut Ctaphid, config: &Config, channel: Channel) -> anyhow::Result<()> {
+    let Some(uid) = active_uid() else {
+        // Nobody is at the machine, so there is no one to ask.
+        hid.send_cbor_status(channel, CtapStatus::UvBlocked)?;
+        return Ok(());
+    };
+
     let ui_response = cancellable_ui(
         hid,
         channel,
@@ -24,6 +31,7 @@ pub fn handle(hid: &mut Ctaphid, config: &Config, channel: Channel) -> anyhow::R
                 ),
                 button: &passkeyd_locale::translate!("passkeyd.cerds.make.presence_ui.button"),
             },
+            uid,
         ),
     );
 

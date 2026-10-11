@@ -245,14 +245,18 @@ impl<T: AsRawFd> Readiness for T {
 }
 
 // Util function
-pub fn spawn_ui<State>(config: &Config, ui: UI, state: State) -> SystemdChild
+///
+/// `uid` is the user the window belongs to. It comes from the active session
+/// rather than from configuration, so a multi-user machine shows the prompt to
+/// whoever is actually at the console.
+pub fn spawn_ui<State>(config: &Config, ui: UI, state: State, uid: u32) -> SystemdChild
 where
     State: Serialize,
 {
     debug!("Spawning UI");
     let unit = format!("passkeyd-interface-{}", Uuid::new_v4());
     let mut child = std::process::Command::new("systemd-run")
-        .arg(format!("--machine={}@", config.gui_uid))
+        .arg(format!("--machine={uid}@"))
         .arg("--user")
         .arg("--collect")
         .arg("--wait")
@@ -271,7 +275,7 @@ where
     SystemdChild {
         inner: child,
         stdin,
-        uid: config.gui_uid,
+        uid,
         unit,
     }
 }
