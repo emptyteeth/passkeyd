@@ -125,10 +125,31 @@ impl FingerprintUI {
         ))
         .class(theme::TextClass::ErrorText);
 
-        let body = column![description, self.retry.then_some(helper_text)]
-            .spacing(16)
-            .height(Length::Fill)
-            .align_x(Alignment::Center);
+        // Where the password prompt has a field to aim at, this screen has
+        // nothing — so it gets a mark to aim at instead. It turns red when a
+        // read fails, to say "again" without needing to be read.
+        let mark_class = if self.retry {
+            theme::SymbolClass::Error
+        } else {
+            theme::SymbolClass::Normal
+        };
+        let mark = passkeyd_abi::component::symbol_icon(
+            passkeyd_abi::component::Symbol::Fingerprint,
+            96.0,
+            mark_class,
+        );
+
+        // Everything sits together in the middle: the icon is the focal point,
+        // and leaving the text up top would strand it above empty space.
+        let body = container(
+            column![mark, description, self.retry.then_some(helper_text)]
+                .spacing(16)
+                .align_x(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
 
         column![title_bar, body]
             .spacing(16)

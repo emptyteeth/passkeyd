@@ -7,7 +7,7 @@ use iced::{
     widget::{
         button, container,
         scrollable::{self, AutoScroll, Rail},
-        text, text_input,
+        svg, text, text_input,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,16 @@ pub struct StylisedTheme {
     #[serde(with = "color_rgba")]
     pub scrollbar_thumb: Color,
 }
+
+/// The colour used for failure text and the failed fingerprint mark.
+///
+/// Not part of the theme: it is fixed so a misconfigured theme cannot make
+/// errors invisible.
+///
+/// The value is a light red rather than a deep one because the background is
+/// dark. The obvious (180, 0, 0) only reaches 2.1:1 against it, below the 3:1
+/// that non-text content should clear; this reaches 4.4:1.
+pub const ERROR_TEXT_COLOR: Color = Color::from_rgb8(235, 90, 90);
 
 impl Default for StylisedTheme {
     fn default() -> Self {
@@ -155,7 +165,7 @@ impl text::Catalog for StylisedTheme {
             TextClass::SecondaryText => self.secondary_text,
             TextClass::ElevatedSurfacePrimaryText => self.surface_primary_text,
             TextClass::ElevatedSurfaceSecondaryText => self.surface_secondary_text,
-            TextClass::ErrorText => Color::from_rgb8(180, 0, 0),
+            TextClass::ErrorText => ERROR_TEXT_COLOR,
         };
 
         text::Style {
@@ -365,3 +375,29 @@ mod color_rgba {
 //         state.end()
 //     }
 // }
+
+/// What a bundled symbol means, so the theme picks its colour — the same way
+/// `TextClass` works. Carrying a semantic name rather than a `Color` is what
+/// lets the widget be built without an instance of the theme.
+#[derive(Debug, Clone, Copy)]
+pub enum SymbolClass {
+    /// The ordinary state: matches secondary text.
+    Normal,
+    /// Something failed and the user should try again.
+    Error,
+}
+
+impl svg::Catalog for StylisedTheme {
+    type Class<'a> = SymbolClass;
+    fn default<'a>() -> Self::Class<'a> {
+        SymbolClass::Normal
+    }
+    fn style(&self, class: &Self::Class<'_>, _status: svg::Status) -> svg::Style {
+        svg::Style {
+            color: Some(match class {
+                SymbolClass::Normal => self.secondary_text,
+                SymbolClass::Error => ERROR_TEXT_COLOR,
+            }),
+        }
+    }
+}

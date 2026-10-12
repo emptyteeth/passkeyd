@@ -102,3 +102,38 @@ where
         .width(Length::Fill)
         .into()
 }
+
+/// A bundled SVG symbol, coloured by the theme according to `class`.
+///
+/// The fingerprint prompt is the only user of this for now: it needs a mark to
+/// aim at, and for that mark to turn red when a read fails.
+///
+/// The markup is compiled in rather than read from disk. These are a few
+/// hundred bytes, and a path that fails to resolve draws *nothing* — which
+/// reads as a broken window rather than a missing asset, and would also have
+/// needed a separate debug path since the file is not installed while
+/// developing.
+pub fn symbol_icon<'a, T: 'a>(
+    name: Symbol,
+    size: f32,
+    class: theme::SymbolClass,
+) -> iced::Element<'a, T, theme::StylisedTheme> {
+    let markup = match name {
+        Symbol::Fingerprint => include_str!("../../resources/icons/fingerprint.svg").as_bytes(),
+    };
+
+    iced::widget::svg(iced::widget::svg::Handle::from_memory(markup))
+        .width(size)
+        .height(size)
+        .class(class)
+        .into()
+}
+
+/// Every symbol compiled into the front-ends.
+///
+/// An enum rather than a string so that asking for a symbol that does not
+/// exist is a compile error: this runs inside the prompt that gates
+/// authentication, where a panic would strand the request.
+pub enum Symbol {
+    Fingerprint,
+}
