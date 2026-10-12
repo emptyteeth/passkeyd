@@ -35,6 +35,8 @@ pub enum MessageBridge {
     Fingerprint(authorize::FingerprintResponse),
     /// Something the daemon sent, or the pipe closing.
     Incoming(Incoming),
+    /// The desktop switched between light and dark.
+    SystemTheme(iced::theme::Mode),
 }
 
 struct StateMachine {
@@ -100,6 +102,11 @@ impl StateMachine {
                 Incoming::Message(message) => self.apply_service_message(message),
                 Incoming::Closed => iced::exit(),
             },
+
+            MessageBridge::SystemTheme(mode) => {
+                theme::set_system_mode(mode);
+                Task::none()
+            }
         }
     }
 
@@ -145,6 +152,14 @@ impl StateMachine {
             Flow::AwaitingFingerprint(ui) => ui.view().map(MessageBridge::Fingerprint),
             Flow::Authorizing(ui) => ui.view().map(MessageBridge::Authorization),
         }
+    }
+
+    fn theme(&self) -> theme::StylisedTheme {
+        theme::current()
+    }
+
+    fn subscription(&self) -> iced::Subscription<MessageBridge> {
+        iced::system::theme_changes().map(MessageBridge::SystemTheme)
     }
 }
 
@@ -212,7 +227,8 @@ pub fn main() -> ExitCode {
             ..Default::default()
         })
         .decorations(false)
-        .theme(|_state: &StateMachine| theme::StylisedTheme::default())
+        .theme(StateMachine::theme)
+        .subscription(StateMachine::subscription)
         .run();
 
     if *authorized.borrow() {

@@ -42,6 +42,8 @@ pub enum Message {
     Reply(ManagerReply),
     Closed,
     Close,
+    /// The desktop switched between light and dark.
+    SystemTheme(iced::theme::Mode),
 }
 
 /// A relying party with the passkeys stored under it.
@@ -153,6 +155,11 @@ impl App {
                     }
                     ManagerReply::Failed(reason) => self.error = Some(reason),
                 }
+                Task::none()
+            }
+
+            Message::SystemTheme(mode) => {
+                theme::set_system_mode(mode);
                 Task::none()
             }
 
@@ -342,7 +349,10 @@ fn main() -> ExitCode {
             },
             ..Default::default()
         })
-        .theme(|_app: &App| theme::StylisedTheme::default())
+        .theme(|_app: &App| theme::current())
+        .subscription(|_app: &App| {
+            iced::system::theme_changes().map(Message::SystemTheme)
+        })
         .run()
         .map(|()| ExitCode::SUCCESS)
         .unwrap_or(ExitCode::FAILURE)

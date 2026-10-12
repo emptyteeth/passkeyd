@@ -21,6 +21,7 @@ pub struct AuthorizationUI {
 enum UserResponse {
     Deny,
     Authorize,
+    SystemTheme(iced::theme::Mode),
 }
 
 static IS_AUTHORIZED: AtomicBool = AtomicBool::new(false);
@@ -39,6 +40,12 @@ impl AuthorizationUI {
                 iced::exit()
             }
             UserResponse::Deny => iced::exit(),
+            // The desktop switched between light and dark; remember it so the
+            // next `theme()` picks the other palette.
+            UserResponse::SystemTheme(mode) => {
+                theme::set_system_mode(mode);
+                Task::none()
+            }
         }
     }
 
@@ -123,7 +130,10 @@ pub fn main() -> ExitCode {
         ..Default::default()
     })
     .decorations(false)
-    .theme(|_state: &AuthorizationUI| theme::StylisedTheme::default())
+    .theme(|_state: &AuthorizationUI| theme::current())
+    .subscription(|_state: &AuthorizationUI| {
+        iced::system::theme_changes().map(UserResponse::SystemTheme)
+    })
     .run();
 
     let is_auth = IS_AUTHORIZED.load(std::sync::atomic::Ordering::SeqCst);
