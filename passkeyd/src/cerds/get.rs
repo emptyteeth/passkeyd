@@ -6,7 +6,7 @@ use ctap_types::ctap2::AuthenticatorDataFlags;
 use ctap_types::ctap2::get_assertion::{AuthenticatorData, Request, Response, ResponseBuilder};
 use ctap_types::{Bytes, webauthn::PublicKeyCredentialRpEntity};
 use ctaphid_types::{Channel, DeviceError};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use sha2::Digest;
 
 use passkeyd_abi::config::{Auth, Config};
@@ -422,11 +422,10 @@ fn authorization_fprint(
         return Ok(fingerprint_fallback("cannot claim the device", error));
     }
 
-    fprint_device.verify_start("")?;
-
-    let mut status_stream = fprint_device.receive_verify_status()?;
-
+    // The status signals arrive on their own thread; the loop below only ever
+    // polls a channel.
     let (tx, rx) = mpsc::channel();
+    let mut status_stream = fprint_device.receive_verify_status()?;
     std::thread::spawn(move || {
         while let Some(signal) = status_stream.next() {
             if let Ok(args) = signal.args() {
@@ -440,6 +439,15 @@ fn authorization_fprint(
     const MAX_ATTEMPTS: usize = 3;
     let mut attempts = 0;
 
+    // A failed read ends the verification session, so `verify-no-match` below
+    // has to stop and restart it — otherwise fprintd is idle while this loop
+    // waits for a signal that will never come, and the next touch does
+    // nothing at all.
+    if let Err(error) = fprint_device.verify_start("") {
+        let _ = fprint_device.release();
+        return Ok(fingerprint_fallback("cannot start verification", error));
+    }
+
     loop {
         if let Ok(status) = rx.try_recv() {
             match status.as_str() {
@@ -449,8 +457,9 @@ fn authorization_fprint(
                     debug!("[Fingerprint] Releasing device...");
                     return Ok(AuthorizationOutcome::Authorized);
                 }
+
                 "verify-no-match" => {
-                    attempts = attempts + 1;
+                    attempts += 1;
 
                     if attempts >= MAX_ATTEMPTS {
                         let _ = fprint_device.verify_stop();
@@ -459,17 +468,52 @@ fn authorization_fprint(
                         return Ok(AuthorizationOutcome::UnAuthorized);
                     }
 
+                    // The session has to be stopped before a new one can
+                    // start: fprintd reports the result but still holds the
+                    // session open, so a bare `verify_start` comes back as
+                    // AlreadyInUse. Without both calls the user is told to try
+                    // again while the reader sits idle, and their next touch
+                    // does nothing.
+                    let _ = fprint_device.verify_stop();
+                    if let Err(error) = fprint_device.verify_start("") {
+                        let _ = fprint_device.release();
+                        return Ok(fingerprint_fallback(
+                            "cannot restart verification",
+                            error,
+                        ));
+                    }
                     child.send(&ServiceMessage::Retry)?;
                 }
-                "verify-unknown-error" => {
-                    let _ = fprint_device.verify_stop();
-                    let _ = fprint_device.release();
-                    debug!("[Fingerprint] Releasing device...");
+
+                // The session is still running and the user just needs to
+                // adjust: re-scan, centre the finger, swipe slower. Telling
+                // them to retry is enough — restarting here would cancel the
+                // scan they are already in the middle of.
+                "verify-retry-scan"
+                | "verify-swipe-too-short"
+                | "verify-finger-not-centered"
+                | "verify-remove-and-retry"
+                | "verify-too-fast" => {
+                    debug!("[Fingerprint] {status}");
+                    child.send(&ServiceMessage::Retry)?;
+                }
+
+                // The device is gone for good; do not touch it again.
+                "verify-disconnected" => {
+                    info!("[Fingerprint] The reader was disconnected");
                     return Ok(AuthorizationOutcome::FallbackToPassword(
                         FallbackToPasswordReason::FingerprintDeviceUnavailable,
                     ));
                 }
-                _ => child.send(&ServiceMessage::Retry)?,
+
+                other => {
+                    warn!("[Fingerprint] Unexpected status '{other}', treating as an error");
+                    let _ = fprint_device.verify_stop();
+                    let _ = fprint_device.release();
+                    return Ok(AuthorizationOutcome::FallbackToPassword(
+                        FallbackToPasswordReason::FingerprintDeviceUnavailable,
+                    ));
+                }
             };
         };
 
