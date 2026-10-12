@@ -45,9 +45,17 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 UMask=0077
 
-# Root reaches its files by ownership, so no capabilities are needed. If you
-# build with TPM support and something below fails, this is the setting to
-# loosen first.
+# The set systemd recommends as a starting point for system services: regular
+# IO and the calls a daemon needs, without the special-purpose ones. It is
+# roomy by design, which matters here — the TPM stack reaches the kernel
+# through several layers, and a hand-written allow-list would have to be
+# validated against a running daemon to avoid denying something it needs.
+SystemCallFilter=@system-service
+
+# Root reaches its files by ownership — /etc/shadow and the passkey store are
+# root-owned and /dev/uhid is root-only — so no capability is needed. If the
+# daemon ever fails to open something it owns, this is the first thing to
+# loosen.
 CapabilityBoundingSet=
 AmbientCapabilities=
 
@@ -55,13 +63,23 @@ AmbientCapabilities=
 # PrivateDevices must NOT be enabled: it would hide /dev/uhid and the TPM,
 # which is the whole point of the daemon. Allow those two explicitly instead.
 # /dev/null, /dev/urandom and friends are always available.
-# Numeric major:minor rather than the char-<group> names: /dev/uhid is
-# misc 10:239 and the TPM resource manager is 252:65536. systemd does not
-# validate group names, so a misspelling would fail silently, whereas these
-# cannot be misread.
+#
+# Device node paths, not char-<group>. A "char-uhid" specifier can never match:
+# char-<name> refers to a device group as listed in /proc/devices, and uhid is
+# a misc device, listed in /proc/misc instead. Worse, systemd does not report
+# it — an unmatched DeviceAllow= is accepted silently, and the failure only
+# shows up later as the daemon being denied permission to create the uhid
+# device. The same trap applies to the TPM ("char-tpm" happens to work, being
+# a real /proc/devices group, but the path is clearer and cannot drift).
+#
+# DevicePolicy=closed is belt and braces. With an explicit DeviceAllow= present
+# the default "auto" already stops allowing everything, and "closed" differs
+# only in naming the standard pseudo devices out loud. It is stated anyway so
+# that deleting a DeviceAllow= line cannot quietly widen access back to every
+# device in the system.
 DevicePolicy=closed
-DeviceAllow=char-10:239 rw
-DeviceAllow=char-252:65536 rw
+DeviceAllow=/dev/uhid rw
+DeviceAllow=/dev/tpmrm0 rw
 
 # --- Network ----------------------------------------------------------------
 # passkeyd has no reason to speak IP. The one outbound request it makes is
