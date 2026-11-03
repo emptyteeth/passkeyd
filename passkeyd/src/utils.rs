@@ -94,6 +94,8 @@ pub fn cancellable_ui(
     channel: Channel,
     mut child: SystemdChild,
 ) -> anyhow::Result<UIResponse> {
+    let mut keepalive = crate::ctaphid::ctaphid::Keepalive::default();
+
     loop {
         if hid.hid.is_readable() {
             // get_webauthn is responsible for readable states
@@ -135,6 +137,9 @@ pub fn cancellable_ui(
                 stdout: child.inner.stdout.take().unwrap(), //stdout will always exist as, the child was created with its stdout piped
             });
         }
+
+        // The host is waiting on this request the whole time the window is up.
+        keepalive.tick(hid, channel);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }

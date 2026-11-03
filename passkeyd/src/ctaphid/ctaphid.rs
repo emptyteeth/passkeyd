@@ -6,7 +6,7 @@ use ctaphid_types::{
 };
 use p256::{ecdh::EphemeralSecret, elliptic_curve::rand_core::OsRng};
 use passkeyd_abi::utils::CborVec;
-use std::{collections::HashMap, fs::File};
+use std::{collections::HashMap, fs::File, time::{Duration, Instant}};
 
 use crate::ctaphid::{
     CtapStatus,
@@ -20,6 +20,14 @@ use super::hid;
 
 type ReturnEvent = anyhow::Result<Option<(Channel, Vec<u8>)>>;
 type HashableChannel = u32;
+
+/// Status byte for a keepalive: the authenticator is still working.
+const KEEPALIVE_PROCESSING: u8 = 0x01;
+
+/// How often to tell the host we are still alive while a request is waiting on
+/// the user. Clients reset their transaction timeout on each one; a client that
+/// enforces the timeout without ever hearing from us aborts the ceremony.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct ChannelPayload {
     pub data: Vec<u8>,
@@ -251,6 +259,14 @@ impl Ctaphid {
         self.send_64response(channel, Command::Cbor, [status as u8])
     }
 
+    /// Tell the host the request is still being worked on.
+    ///
+    /// Sent between the request and its response; the client resets its
+    /// transaction timeout each time one arrives.
+    pub fn send_keepalive(&mut self, channel: Channel) -> anyhow::Result<()> {
+        self.send_64response(channel, Command::KeepAlive, [KEEPALIVE_PROCESSING])
+    }
+
     // pub fn free_channel(&mut self) {
     //     self.channel = None;
     // }
@@ -292,5 +308,61 @@ impl Ctaphid {
         self.hid.write(report.as_ref())?;
 
         Ok(())
+    }
+}
+
+/// Sends a keepalive no more often than [`KEEPALIVE_INTERVAL`].
+///
+/// The request handlers all poll in a loop while waiting on the user; each one
+/// owns a `Keepalive` and ticks it every pass. Errors are ignored on purpose:
+/// if the host has gone away the response will fail too, and the ceremony is
+/// over either way.
+pub struct Keepalive {
+    last: Option<Instant>,
+}
+
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self { last: None }
+    }
+}
+
+impl Keepalive {
+    pub fn tick(&mut self, hid: &mut Ctaphid, channel: Channel) {
+        let due = self
+            .last
+            .map(|last| last.elapsed() >= KEEPALIVE_INTERVAL)
+            .unwrap_or(true);
+
+        if due && hid.send_keepalive(channel).is_ok() {
+            self.last = Some(Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+
+    /// The wire format the host expects: channel, command with the response
+    /// bit, a one-byte payload, and zero padding to 64.
+    #[test]
+    fn keepalive_encodes_as_a_single_byte_response_packet() {
+        let packet = InitializationPacket {
+            channel: Channel::from(0x0102_0304u32),
+            command: Command::KeepAlive,
+            length: 1,
+            data: [KEEPALIVE_PROCESSING],
+        };
+
+        let mut report = [0u8; 64];
+        packet.serialize(&mut report).unwrap();
+
+        assert_eq!(&report[..4], &0x0102_0304u32.to_be_bytes());
+        // 0x3B is CTAPHID_KEEPALIVE; responses set bit 7.
+        assert_eq!(report[4], 0x3B | 0x80);
+        assert_eq!(&report[5..7], &[0x00, 0x01]);
+        assert_eq!(report[7], 0x01);
+        assert!(report[8..].iter().all(|b| *b == 0), "padding must be zero");
     }
 }

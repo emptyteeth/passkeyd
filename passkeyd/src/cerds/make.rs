@@ -41,6 +41,10 @@ pub fn make(
     config: &Config,
     req: Request,
 ) -> anyhow::Result<Response> {
+    // The host has started its transaction timer. A keepalive now buys time for
+    // key generation, which happens before the prompt is shown.
+    let _ = hid.send_keepalive(channel);
+
     // New passkeys are owned by whoever is at the console.
     let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
 

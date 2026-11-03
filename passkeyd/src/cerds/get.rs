@@ -1,5 +1,5 @@
 use std::sync::mpsc::{self, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use ctap_types::ctap2::AuthenticatorDataFlags;
@@ -23,7 +23,7 @@ use crate::auth::fprintd::{FprintDeviceProxyBlocking, FprintManagerProxyBlocking
 use crate::auth::pam::InteractiveConversation;
 use crate::auth::pass::{PasswordCheck, check_password};
 use crate::cryptography;
-use crate::ctaphid::ctaphid::Ctaphid;
+use crate::ctaphid::ctaphid::{Ctaphid, Keepalive};
 use crate::ctaphid::{CtapStatus, TransportError};
 use crate::utils::{cancellable_ui, has_another_fido_device};
 
@@ -33,6 +33,11 @@ pub fn get(
     config: &Config,
     req: Request,
 ) -> anyhow::Result<Response> {
+    // The host has started its transaction timer. A keepalive now buys time
+    // for the work below (loading passkeys, and the TPM sign at the end)
+    // before the polling loops take over.
+    let _ = hid.send_keepalive(channel);
+
     // Who is asking. Everything below is scoped to them: only their passkeys
     // are loaded, and only their credentials can authorize.
     let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
@@ -282,6 +287,28 @@ enum AuthorizationOutcome {
 /// before the daemon kills its unit.
 const UI_EXIT_GRACE: Duration = Duration::from_millis(500);
 
+/// Wait for the UI to close, keeping the host informed while it does.
+///
+/// The browser is still waiting on this CTAP request during the grace period,
+/// so it must hear from us here too.
+fn wait_for_ui_exit(
+    hid: &mut Ctaphid,
+    channel: Channel,
+    child: &mut SystemdChild,
+    keepalive: &mut Keepalive,
+) {
+    let deadline = Instant::now() + UI_EXIT_GRACE;
+
+    while Instant::now() < deadline {
+        keepalive.tick(hid, channel);
+
+        match child.inner.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 fn authenticate_handler(
     hid: &mut Ctaphid,
     channel: Channel,
@@ -291,6 +318,7 @@ fn authenticate_handler(
 ) -> anyhow::Result<usize> {
     let mut child = spawn_ui(config, UI::KeySelect, ui_state, uid);
     let mut reader = FrameReader::<UIMessage>::new();
+    let mut keepalive = Keepalive::default();
 
     loop {
         if let Some(event) = try_ui_message(hid, channel, &mut child, &mut reader)? {
@@ -301,14 +329,15 @@ fn authenticate_handler(
                     } else {
                         // Nothing further is expected from the UI; let it close
                         // itself rather than killing it mid-render.
-                        child.wait_for_exit(UI_EXIT_GRACE);
+                        wait_for_ui_exit(hid, channel, &mut child, &mut keepalive);
                     }
                     return Ok(i);
                 }
                 _ => unreachable!(),
             }
         } else {
-            std::thread::sleep(Duration::from_millis(200));
+            keepalive.tick(hid, channel);
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -323,6 +352,8 @@ fn authorization(
     reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<()> {
     let mut auth = &config.auth;
+    let mut keepalive = Keepalive::default();
+
     loop {
         let auth_outcome = match auth {
             Auth::PASS => authorization_pass(hid, channel, uid, child, reader),
@@ -338,12 +369,12 @@ fn authorization(
                 let _ = child.send(&ServiceMessage::Authorized);
                 // Give the UI a moment to tear itself down before `Drop` kills
                 // the unit out from under it.
-                child.wait_for_exit(UI_EXIT_GRACE);
+                wait_for_ui_exit(hid, channel, child, &mut keepalive);
                 return Ok(());
             }
             AuthorizationOutcome::UnAuthorized => {
                 let _ = child.send(&ServiceMessage::Denied);
-                child.wait_for_exit(UI_EXIT_GRACE);
+                wait_for_ui_exit(hid, channel, child, &mut keepalive);
                 anyhow::bail!(CtapStatus::UvBlocked);
             }
             AuthorizationOutcome::FallbackToPassword(reason) => {
@@ -374,6 +405,8 @@ fn authorization_fprint(
     child: &mut SystemdChild,
     _reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<AuthorizationOutcome> {
+    let mut keepalive = Keepalive::default();
+
     let Ok(connection) = Connection::system() else {
         return Ok(fingerprint_fallback(
             "cannot reach the system bus",
@@ -535,7 +568,8 @@ fn authorization_fprint(
             anyhow::bail!(CtapStatus::KeepaliveCancel);
         };
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        keepalive.tick(hid, channel);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -546,6 +580,8 @@ fn authorization_pam(
     child: &mut SystemdChild,
     reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<AuthorizationOutcome> {
+    let mut keepalive = Keepalive::default();
+
     let (question_tx, question_rx) = mpsc::channel();
     let (answer_tx, answer_rx) = mpsc::channel();
     let (pam_result_tx, pam_result_rx) = mpsc::channel();
@@ -592,7 +628,8 @@ fn authorization_pam(
             Err(TryRecvError::Empty) => (),
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        keepalive.tick(hid, channel);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -603,6 +640,8 @@ fn authorization_pass(
     child: &mut SystemdChild,
     reader: &mut FrameReader<UIMessage>,
 ) -> anyhow::Result<AuthorizationOutcome> {
+    let mut keepalive = Keepalive::default();
+
     let username = username_from_uid(uid).ok_or(CtapStatus::OperationDenied)?;
 
     loop {
@@ -631,7 +670,8 @@ fn authorization_pass(
                 PasswordCheck::Rejected => child.send(&ServiceMessage::Retry)?,
             }
         };
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        keepalive.tick(hid, channel);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
