@@ -125,12 +125,12 @@ impl Passkey {
         }
     }
 
-    pub fn store(self, rp: PublicKeyCredentialRpEntity) {
-        set_passkey(rp, self);
+    pub fn store(self, rp: PublicKeyCredentialRpEntity) -> anyhow::Result<()> {
+        set_passkey(rp, self)
     }
 
-    pub fn sign_increment(self, rp: PublicKeyCredentialRpEntity) {
-        increment_sign_count(rp, self);
+    pub fn sign_increment(self, rp: PublicKeyCredentialRpEntity) -> anyhow::Result<()> {
+        increment_sign_count(rp, self)
     }
 
     pub fn get(

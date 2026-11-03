@@ -52,6 +52,10 @@ pub fn handle(
             } else if let Some(err) = e.downcast_ref::<TransportError>() {
                 hid.send_portocal_error(err.channel, err.err)?;
             } else {
+                // Whatever it was (a TPM failure, an I/O error), the platform
+                // only sees "other"; the journal is the only place the reason
+                // survives.
+                error!("GetAssertion failed: {e:#}");
                 report[0] = CtapStatus::Other as u8;
                 hid.send_64response(channel, Command::Cbor, &report[0..1])?;
             }

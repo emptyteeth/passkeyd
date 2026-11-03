@@ -51,7 +51,7 @@ pub fn make(
 
     check_excluded_credential(hid, channel, config, uid, &req)?;
 
-    let mut crypto = cryptography::resolve_cryptography(config);
+    let mut crypto = cryptography::resolve_cryptography(config)?;
     let (crypto_pair, credential_public_key) = generate_credentials(crypto.as_mut(), &req)?;
     debug!("Generated wrapped private and public keys");
     let passkey = Passkey::new(req.rp.id.clone(), req.user.clone(), crypto_pair, uid);
@@ -155,7 +155,7 @@ pub fn make(
     }
 
     if !is_selection_req {
-        passkey.store(req.rp);
+        passkey.store(req.rp)?;
     }
 
     Ok(res)

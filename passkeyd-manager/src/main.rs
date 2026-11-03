@@ -108,7 +108,12 @@ fn handle(request: ManagerRequest, child: &mut SystemdChild) -> anyhow::Result<b
             match find_site_of(&credential_id) {
                 Some(rp) => {
                     info!("Removing a passkey for {}", rp.id);
-                    remove_passkey(&rp, &credential_id);
+                    if let Err(e) = remove_passkey(&rp, &credential_id) {
+                        child.send(&ManagerReply::Failed(format!(
+                            "Could not delete that passkey: {e}"
+                        )))?;
+                        return Ok(true);
+                    }
                 }
                 None => {
                     child.send(&ManagerReply::Failed(
@@ -122,7 +127,12 @@ fn handle(request: ManagerRequest, child: &mut SystemdChild) -> anyhow::Result<b
         ManagerRequest::DeleteSite { rp_id } => match relying_party(&rp_id) {
             Some(rp) => {
                 info!("Removing every passkey for {rp_id}");
-                remove_table(&rp);
+                if let Err(e) = remove_table(&rp) {
+                    child.send(&ManagerReply::Failed(format!(
+                        "Could not delete those passkeys: {e}"
+                    )))?;
+                    return Ok(true);
+                }
             }
             None => {
                 child.send(&ManagerReply::Failed(format!(

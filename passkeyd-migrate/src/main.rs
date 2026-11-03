@@ -135,7 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name: None,
             };
 
-            new_passkey_model.store(mock_rp);
+            if let Err(error) = new_passkey_model.store(mock_rp) {
+                eprintln!("could not write a passkey for {rp_id}: {error}");
+                continue;
+            }
 
             println!(
                 "{}",

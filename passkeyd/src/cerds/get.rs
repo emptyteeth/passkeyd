@@ -103,7 +103,7 @@ pub fn get(
     let mut signed_payload = auth_data_bytes.to_vec();
     signed_payload.extend_from_slice(req.client_data_hash);
 
-    let mut crypto = cryptography::resolve_cryptography(config);
+    let mut crypto = cryptography::resolve_cryptography(config)?;
     let (_, sign) = crypto.sign_payload(
         authorized_passkey.credential_source.crypto_pair.clone(),
         &signed_payload,
@@ -151,7 +151,11 @@ pub fn get(
         None => None,
     };
 
-    authorized_passkey.sign_increment(rp_entity);
+    // The assertion itself is already built; failing to persist the counter
+    // must not fail a valid login. It only costs the RP a repeated count.
+    if let Err(e) = authorized_passkey.sign_increment(rp_entity) {
+        error!("Cannot update the sign count: {e}");
+    }
 
     Ok(response)
 }

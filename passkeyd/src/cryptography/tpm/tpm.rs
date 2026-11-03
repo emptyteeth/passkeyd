@@ -62,19 +62,20 @@ fn compute_explicit_pcr_digest(
 
 fn initialize_policy_session(ctx: &mut Context) -> anyhow::Result<()> {
     ctx.set_sessions((None, None, None));
-    let session_handle = ctx
-        .start_auth_session(
-            None,
-            None,
-            None,
-            SessionType::Policy,
-            SymmetricDefinition::Aes {
-                key_bits: AesKeyBits::Aes128,
-                mode: SymmetricMode::Cfb,
-            },
-            HashingAlgorithm::Sha256,
-        )?
-        .unwrap(); //can fail in out of sessions case, which ofc is rare.
+    let Some(session_handle) = ctx.start_auth_session(
+        None,
+        None,
+        None,
+        SessionType::Policy,
+        SymmetricDefinition::Aes {
+            key_bits: AesKeyBits::Aes128,
+            mode: SymmetricMode::Cfb,
+        },
+        HashingAlgorithm::Sha256,
+    )?
+    else {
+        anyhow::bail!("the TPM has no free session for the PCR policy");
+    };
 
     // binding to a secure boot
     let pcr_selection = PcrSelectionListBuilder::new()
@@ -93,19 +94,20 @@ fn initialize_policy_session(ctx: &mut Context) -> anyhow::Result<()> {
 pub fn get_pcr7_policy(ctx: &mut Context) -> anyhow::Result<Digest> {
     let current_session = ctx.sessions();
     ctx.set_sessions((None, None, None));
-    let session_handle = ctx
-        .start_auth_session(
-            None,
-            None,
-            None,
-            SessionType::Trial,
-            SymmetricDefinition::Aes {
-                key_bits: AesKeyBits::Aes128,
-                mode: SymmetricMode::Cfb,
-            },
-            HashingAlgorithm::Sha256,
-        )?
-        .unwrap();
+    let Some(session_handle) = ctx.start_auth_session(
+        None,
+        None,
+        None,
+        SessionType::Trial,
+        SymmetricDefinition::Aes {
+            key_bits: AesKeyBits::Aes128,
+            mode: SymmetricMode::Cfb,
+        },
+        HashingAlgorithm::Sha256,
+    )?
+    else {
+        anyhow::bail!("the TPM has no free session for the PCR policy");
+    };
 
     // binding to a secure boot
     let pcr_selection = PcrSelectionListBuilder::new()

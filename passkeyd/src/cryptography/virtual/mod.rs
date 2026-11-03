@@ -63,7 +63,7 @@ impl CryptoBackend for Virtual {
             }
         } else {
             warn!("Using TPM singing, even though the configuration is set to virtual.");
-            let mut tpm = Tpm::new().expect("Failed to initialize TPM hardware backend. Are you sure you have TPM? You can check this with the command `ls /dev/tpm*`. If this returns nothing, either you don't have TPM or it isn't functioning properly. You might want to switch to virtual cryptography.");
+            let mut tpm = Tpm::new()?;
             tpm.sign_payload(crypto_pair, payload)
         }
     }
