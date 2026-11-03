@@ -1,3 +1,6 @@
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
+
 use ctaphid_types::{Channel, DeviceError, Packet};
 use log::{debug, error};
 use rand::{RngCore, rng};
@@ -11,6 +14,25 @@ use crate::ctaphid::{
 /// continuation packets (57 + 128 * 59).
 pub const MAX_MESSAGE_SIZE: usize = 7609;
 
+/// How long a message may take, from its initialization packet to its last
+/// continuation packet.
+///
+/// The protocol requires a transaction timeout so an application that dies
+/// mid-message cannot lock the device out, and leaves the value to the
+/// implementation. A whole message takes milliseconds on USB, so this is
+/// generous by design.
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What became of the rest of a message.
+pub enum Collected {
+    /// Every packet arrived.
+    Complete,
+    /// Something else arrived, so the pending payload is invalid.
+    Interrupted,
+    /// The rest did not arrive before the deadline.
+    TimedOut,
+}
+
 pub fn generate_new_cid() -> Channel {
     loop {
         let mut cid = [0u8; 4];
@@ -23,16 +45,65 @@ pub fn generate_new_cid() -> Channel {
     }
 }
 
-pub fn collect_all_packet(
-    ctaphid: &mut Ctaphid,
-    // payload_buffer: &mut Vec<u8>,
-    // next_sequence: u8,
-) -> anyhow::Result<bool> {
-    let event = ctaphid.hid.read()?;
+/// Waits until `fd` is readable or `deadline` passes.
+///
+/// Returns `false` if the deadline passed first.
+fn wait_readable(fd: std::os::fd::RawFd, deadline: Instant) -> std::io::Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+
+        match unsafe { libc::poll(&mut poll_fd, 1, millis) } {
+            0 => return Ok(false),
+            ready if ready > 0 => return Ok(true),
+            _ => {
+                let error = std::io::Error::last_os_error();
+                // A signal interrupted the wait; the deadline still applies.
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Waits for the next UHID event, but not past `deadline`.
+///
+/// `UHIDDevice::read` blocks in `read_exact`, so without this a host that
+/// stops sending mid-message would keep the daemon from serving anyone else.
+fn read_event(ctaphid: &mut Ctaphid, deadline: Instant) -> anyhow::Result<Option<OutputEvent>> {
+    if wait_readable(ctaphid.hid.as_raw_fd(), deadline)? {
+        Ok(Some(ctaphid.hid.read()?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn collect_all_packet(ctaphid: &mut Ctaphid) -> anyhow::Result<Collected> {
+    collect_until(ctaphid, Instant::now() + MESSAGE_TIMEOUT)
+}
+
+fn collect_until(ctaphid: &mut Ctaphid, deadline: Instant) -> anyhow::Result<Collected> {
+    let Some(event) = read_event(ctaphid, deadline)? else {
+        error!("Timed out waiting for the rest of a CTAPHID message");
+        return Ok(Collected::TimedOut);
+    };
 
     let OutputEvent::Output { data: report_bytes } = event else {
+        // Device open/close/start/stop: not data, and no reason to abandon
+        // the message.
         ctaphid.event_handler(event)?;
-        return Ok(false);
+        return collect_until(ctaphid, deadline);
     };
 
     let ctaphid_packet: Packet<Vec<u8>> = match parse_report(&report_bytes) {
@@ -42,7 +113,7 @@ pub fn collect_all_packet(
             if let Some(channel) = malformed.channel {
                 ctaphid.send_portocal_error(channel, malformed.err)?;
             }
-            return Ok(false);
+            return Ok(Collected::Interrupted);
         }
     };
 
@@ -83,11 +154,10 @@ pub fn collect_all_packet(
                     "[Packet Collector] [Channel: {}]: All packets have been accumulated.",
                     continuation_packet.channel
                 );
-                Ok(true)
+                Ok(Collected::Complete)
             } else {
-                // recursively collect more packets
                 channel_payload.next_expected_sequence += 1;
-                collect_all_packet(ctaphid)
+                collect_until(ctaphid, deadline)
             }
         }
         Packet::Initialization(_) => {
@@ -99,7 +169,7 @@ pub fn collect_all_packet(
             {
                 ctaphid.send_portocal_error(other_channel, DeviceError::ChannelBusy)?;
             }
-            Ok(false)
+            Ok(Collected::Interrupted)
         }
     }
 }
@@ -116,5 +186,31 @@ pub fn device_err_into_bytes(err: DeviceError) -> u8 {
         DeviceError::InvalidChannel => 0x0B,   // ERR_INVALID_CID (Standard value is 0x0B)
         DeviceError::Other => 0x7F,            // ERR_OTHER (Standard value is 0x7F)
         DeviceError::Unknown(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn waiting_past_the_deadline_reports_a_timeout() {
+        let (_tx, rx) = UnixStream::pair().unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(!wait_readable(rx.as_raw_fd(), deadline).unwrap());
+    }
+
+    #[test]
+    fn waiting_returns_as_soon_as_data_arrives() {
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.write_all(b"x").unwrap();
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        assert!(wait_readable(rx.as_raw_fd(), deadline).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

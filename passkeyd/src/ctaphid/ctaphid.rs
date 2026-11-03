@@ -9,7 +9,9 @@ use std::{collections::HashMap, fs::File, time::{Duration, Instant}};
 use crate::ctaphid::{
     CtapStatus,
     hid::OutputEvent,
-    utils::{collect_all_packet, device_err_into_bytes, generate_new_cid, MAX_MESSAGE_SIZE},
+    utils::{
+        Collected, collect_all_packet, device_err_into_bytes, generate_new_cid, MAX_MESSAGE_SIZE,
+    },
 };
 
 use log::{debug, error};
@@ -155,12 +157,23 @@ impl Ctaphid {
                 if channel_payload.data.len() < channel_payload.data.capacity() {
                     debug!("Initialization payload is incomplete, collecting additional packets.");
                     match collect_all_packet(self) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            // Interrupted by a malformed packet or by another
-                            // request. The payload is incomplete, so it must
-                            // not be dispatched as if it were whole.
+                        Ok(Collected::Complete) => {}
+                        Ok(Collected::Interrupted) => {
+                            // Something else arrived; the payload is
+                            // incomplete, so it must not be dispatched as if
+                            // it were whole.
                             self.payload_stack.remove(&init_packet.channel.into());
+                            return Ok(None);
+                        }
+                        Ok(Collected::TimedOut) => {
+                            // Back the transaction out so the channel returns
+                            // to idle instead of holding the device until the
+                            // host gives up.
+                            self.payload_stack.remove(&init_packet.channel.into());
+                            self.send_portocal_error(
+                                init_packet.channel,
+                                DeviceError::MessageTimeout,
+                            )?;
                             return Ok(None);
                         }
                         Err(err) => {
@@ -188,14 +201,14 @@ impl Ctaphid {
                 )
             }
             // Continuation packets are collected by collect_all_packet(). One
-            // reaching this point has no initialization packet to belong to,
-            // typically because the transaction before it was cancelled.
+            // reaching this point has no initialization packet to belong to —
+            // it is left over from a transaction that was aborted or timed
+            // out. §11.2.5.4 says spurious continuations are ignored.
             Packet::Continuation(continuation) => {
-                error!(
-                    "Unexpected continuation packet on channel {}",
+                debug!(
+                    "Ignoring spurious continuation packet on channel {}",
                     continuation.channel
                 );
-                self.send_portocal_error(continuation.channel, DeviceError::InvalidSequence)?;
                 return Ok(None);
             }
         }
