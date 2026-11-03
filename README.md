@@ -10,6 +10,30 @@
 
 Passkeyd is a Linux based WebAuthn authenticator that works with any WebAuthn supported application, including browsers. It supports both TPM and non-TPM devices.
 
+## Security model
+
+Two things are worth knowing before relying on this.
+
+**User verification is enforced by passkeyd, not by the TPM.** The fingerprint,
+password or PAM check happens in the daemon. Root can read the stored passkey
+blobs and ask the TPM to sign without going through it. What the TPM protects
+is the private key itself: it never leaves the chip and cannot be copied to
+another machine. For everyone who is not root, user verification still has to
+be passed.
+
+**With `USE_TPM_CRYPTOGRAPHY=yes`, passkeys are bound to PCR 7** — the Secure
+Boot policy (PK/KEK/db/dbx). A passkey only works while PCR 7 holds the value
+it had when the passkey was created. Updating the Secure Boot key databases (a
+`dbx` revocation update through fwupd or Windows Update, for example), changing
+the platform key, or switching Secure Boot on or off changes PCR 7 and makes
+existing passkeys unusable. The binding is stored inside the key and cannot be
+changed afterwards, so such a passkey has to be deleted and registered again on
+the website. Expect this roughly once or twice a year, the same way TPM-backed
+LUKS unlock has to be re-enrolled after these updates.
+
+Clearing the TPM, or resetting its owner hierarchy, also invalidates every
+stored passkey, because they are wrapped by a key derived from that hierarchy.
+
 ## Installation
 
 #### Install Binaries

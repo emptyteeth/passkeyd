@@ -1,4 +1,3 @@
-use anyhow::Ok;
 use log::debug;
 use sha2::Sha256;
 use std::str::FromStr;
@@ -6,7 +5,7 @@ use tss_esapi::{
     Context, TctiNameConf,
     attributes::ObjectAttributesBuilder,
     constants::{
-        SessionType,
+        SessionType, Tss2ResponseCodeKind,
         tss::{TPM2_RH_NULL, TPM2_ST_HASHCHECK},
     },
     handles::{KeyHandle, ObjectHandle, SessionHandle},
@@ -19,7 +18,7 @@ use tss_esapi::{
     },
     structures::{
         self, Auth, Digest, EccPoint, EccScheme, HashcheckTicket, KeyDerivationFunctionScheme,
-        PcrSelectionList, PcrSelectionListBuilder, PcrSlot, Private, Public, PublicBuilder,
+        PcrSelectionListBuilder, PcrSlot, Private, Public, PublicBuilder,
         PublicEccParametersBuilder, Signature, SignatureScheme, SymmetricDefinition,
         SymmetricDefinitionObject,
     },
@@ -36,7 +35,17 @@ pub fn initialize_tpm_with_session() -> anyhow::Result<Context> {
 fn initialize_tpm() -> anyhow::Result<Context> {
     let tcti = TctiNameConf::from_str("device:/dev/tpmrm0")?;
     let mut ctx = Context::new(tcti)?;
-    ctx.startup(tss_esapi::constants::StartupType::Clear)?;
+
+    // The firmware, or another client, has usually started the TPM already,
+    // and TPM2_Startup then answers TPM_RC_INITIALIZE. That is the normal
+    // case, not a failure.
+    match ctx.startup(tss_esapi::constants::StartupType::Clear) {
+        Ok(()) => {}
+        Err(tss_esapi::Error::Tss2Error(code))
+            if code.kind() == Some(Tss2ResponseCodeKind::Initialize) => {}
+        Err(e) => return Err(e.into()),
+    }
+
     Ok(ctx)
 }
 
@@ -45,21 +54,12 @@ fn initialize_pass_session(ctx: &mut Context) {
     ctx.set_sessions((Some(AuthSession::Password), None, None));
 }
 
-// some duct tape function
-fn compute_explicit_pcr_digest(
-    ctx: &mut Context,
-    pcr_selection: PcrSelectionList,
-) -> anyhow::Result<Digest> {
-    let (_, _, pcr_data) = ctx.pcr_read(pcr_selection)?;
-    use sha2::Digest as ShaDigest;
-    let mut hasher = Sha256::new();
-    pcr_data
-        .value()
-        .iter()
-        .for_each(|pcr| hasher.update(pcr.value()));
-    Ok(Digest::try_from(hasher.finalize().as_slice())?)
-}
-
+/// Binds the policy session to the current Secure Boot state.
+///
+/// The empty digest tells the TPM to compute the digest of the selected PCRs
+/// itself — the same value it compares against the key's `authPolicy` when
+/// signing, and the same value a Trial session folds into a new policy. Doing
+/// that computation by hand was only correct for one bank and one PCR.
 fn initialize_policy_session(ctx: &mut Context) -> anyhow::Result<()> {
     ctx.set_sessions((None, None, None));
     let Some(session_handle) = ctx.start_auth_session(
@@ -77,20 +77,22 @@ fn initialize_policy_session(ctx: &mut Context) -> anyhow::Result<()> {
         anyhow::bail!("the TPM has no free session for the PCR policy");
     };
 
-    // binding to a secure boot
     let pcr_selection = PcrSelectionListBuilder::new()
         .with_selection(HashingAlgorithm::Sha256, &[PcrSlot::Slot7])
         .build()?;
 
-    let pcr_digest = compute_explicit_pcr_digest(ctx, pcr_selection.clone())?;
-
-    ctx.policy_pcr(session_handle.try_into()?, pcr_digest, pcr_selection)?;
-    // ctx.policy_pcr(session_handle.try_into()?, Digest::default(), pcr_selection)?;
+    ctx.policy_pcr(session_handle.try_into()?, Digest::default(), pcr_selection)?;
     ctx.set_sessions((Some(session_handle), None, None));
     debug!("TPM session set to PCR 7 policy.");
     Ok(())
 }
 
+/// Computes the policy digest a key would get if it were bound to the current
+/// Secure Boot state (PCR 7).
+///
+/// A Trial session evaluates the same commands as a Policy session but only
+/// accumulates the digest, so the result is exactly the `authPolicy` that
+/// `initialize_policy_session` will later have to satisfy.
 pub fn get_pcr7_policy(ctx: &mut Context) -> anyhow::Result<Digest> {
     let current_session = ctx.sessions();
     ctx.set_sessions((None, None, None));
@@ -109,14 +111,11 @@ pub fn get_pcr7_policy(ctx: &mut Context) -> anyhow::Result<Digest> {
         anyhow::bail!("the TPM has no free session for the PCR policy");
     };
 
-    // binding to a secure boot
     let pcr_selection = PcrSelectionListBuilder::new()
         .with_selection(HashingAlgorithm::Sha256, &[PcrSlot::Slot7])
         .build()?;
 
-    let pcr_digest = compute_explicit_pcr_digest(ctx, pcr_selection.clone())?;
-    ctx.policy_pcr(session_handle.try_into()?, pcr_digest, pcr_selection)?;
-    // ctx.policy_pcr(session_handle.try_into()?, Digest::default(), pcr_selection)?;
+    ctx.policy_pcr(session_handle.try_into()?, Digest::default(), pcr_selection)?;
     let p = ctx.policy_get_digest(session_handle.try_into()?)?;
     ctx.flush_context(ObjectHandle::from(SessionHandle::from(session_handle)))?;
     ctx.set_sessions(current_session);
