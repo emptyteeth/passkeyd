@@ -148,7 +148,10 @@ pub fn make(
 
     if !status.success() {
         info!("Authorization denied");
-        anyhow::bail!(CtapStatus::OperationDenied);
+        // Closing the window is a cancellation, not OPERATION_DENIED. Firefox
+        // treats OPERATION_DENIED under built-in UV as a failed verification
+        // and repeats the request, which would reopen the enrollment window.
+        anyhow::bail!(CtapStatus::KeepaliveCancel);
     }
 
     if !is_selection_req {

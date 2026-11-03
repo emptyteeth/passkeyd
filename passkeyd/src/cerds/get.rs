@@ -298,7 +298,9 @@ fn authorize_presence(
         .success();
 
     if !approved {
-        anyhow::bail!(CtapStatus::OperationDenied);
+        // Closing the presence window is the user cancelling, not a failed
+        // verification; see try_ui_message().
+        anyhow::bail!(CtapStatus::KeepaliveCancel);
     }
 
     if passkeys.is_empty() {
@@ -629,7 +631,9 @@ fn authorization_fprint(
         {
             let _ = fprint_device.verify_stop();
             let _ = fprint_device.release();
-            anyhow::bail!(CtapStatus::OperationDenied);
+            // The user closed the window; see try_ui_message() for why this is
+            // a cancellation and not OPERATION_DENIED.
+            anyhow::bail!(CtapStatus::KeepaliveCancel);
         }
 
         if try_recv_cancel(hid, channel)?.is_some() {
@@ -806,7 +810,12 @@ fn try_ui_message(
         .context("failed to poll UI process")?
         .is_some()
     {
-        anyhow::bail!(CtapStatus::OperationDenied);
+        // The user closed the window. Report this as a cancellation rather
+        // than OPERATION_DENIED: Firefox's authenticator-rs treats
+        // OPERATION_DENIED while using built-in UV as "the verification
+        // gesture failed" and repeats the whole request, so the window would
+        // come straight back. A cancellation is terminal for both browsers.
+        anyhow::bail!(CtapStatus::KeepaliveCancel);
     }
 
     Ok(None)
