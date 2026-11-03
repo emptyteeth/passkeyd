@@ -13,7 +13,7 @@ use crate::{
 pub fn handle(hid: &mut Ctaphid, config: &Config, channel: Channel) -> anyhow::Result<()> {
     let Some(uid) = active_uid() else {
         // Nobody is at the machine, so there is no one to ask.
-        hid.send_cbor_status(channel, CtapStatus::UvBlocked)?;
+        hid.send_cbor_status(channel, CtapStatus::OperationDenied)?;
         return Ok(());
     };
 
@@ -40,7 +40,9 @@ pub fn handle(hid: &mut Ctaphid, config: &Config, channel: Channel) -> anyhow::R
             if exit_status.success() {
                 hid.send_cbor_status(channel, CtapStatus::Ok)?;
             } else {
-                hid.send_cbor_status(channel, CtapStatus::KeepaliveCancel)?;
+                // The user declined. Cancellation arrives through the error
+                // path below as KEEPALIVE_CANCEL; this is a plain refusal.
+                hid.send_cbor_status(channel, CtapStatus::OperationDenied)?;
             }
         }
         Err(e) => {

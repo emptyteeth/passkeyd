@@ -45,8 +45,9 @@ pub fn make(
     // key generation, which happens before the prompt is shown.
     let _ = hid.send_keepalive(channel);
 
-    // New passkeys are owned by whoever is at the console.
-    let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
+    // New passkeys are owned by whoever is at the console. Nobody there is a
+    // denied operation, not a blocked authenticator.
+    let uid = active_uid().ok_or(CtapStatus::OperationDenied)?;
 
     check_excluded_credential(hid, channel, config, uid, &req)?;
 

@@ -39,8 +39,9 @@ pub fn get(
     let _ = hid.send_keepalive(channel);
 
     // Who is asking. Everything below is scoped to them: only their passkeys
-    // are loaded, and only their credentials can authorize.
-    let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
+    // are loaded, and only their credentials can authorize. Nobody at the
+    // console is a denied operation, not a blocked authenticator.
+    let uid = active_uid().ok_or(CtapStatus::OperationDenied)?;
 
     let (rp_entity, mut passkeys) = load_passkeys(&req, uid)?;
 
@@ -338,6 +339,9 @@ fn authorize_selection(
 enum AuthorizationOutcome {
     Authorized,
     UnAuthorized,
+    /// The account is locked out after repeated failures. This is the one case
+    /// that maps to `UV_BLOCKED`; a plain failure is `OPERATION_DENIED`.
+    LockedOut,
     FallbackToPassword(FallbackToPasswordReason),
 }
 
@@ -431,6 +435,15 @@ fn authorization(
                 return Ok(());
             }
             AuthorizationOutcome::UnAuthorized => {
+                let _ = child.send(&ServiceMessage::Denied);
+                wait_for_ui_exit(hid, channel, child, &mut keepalive);
+                // A failed verification is not a blocked authenticator. The
+                // platform turns both into NotAllowedError, but UV_BLOCKED
+                // means "stop trying for a while", which is reserved for the
+                // lockout below.
+                anyhow::bail!(CtapStatus::OperationDenied);
+            }
+            AuthorizationOutcome::LockedOut => {
                 let _ = child.send(&ServiceMessage::Denied);
                 wait_for_ui_exit(hid, channel, child, &mut keepalive);
                 anyhow::bail!(CtapStatus::UvBlocked);
@@ -715,7 +728,7 @@ fn authorization_pass(
                         "[Password] {username} is locked out for another {}s",
                         retry_after.as_secs()
                     );
-                    return Ok(AuthorizationOutcome::UnAuthorized);
+                    return Ok(AuthorizationOutcome::LockedOut);
                 }
 
                 // Retrying cannot fix an expired or locked account, so stop
