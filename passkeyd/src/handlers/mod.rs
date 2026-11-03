@@ -1,9 +1,9 @@
-use ctap_types::ctap2::Request;
+use ctap_types::ctap2::{self, Request};
 use ctaphid_types::Channel;
-use log::debug;
+use log::{debug, error};
 use passkeyd_abi::config::Config;
 
-use crate::ctaphid::ctaphid::Ctaphid;
+use crate::ctaphid::{CtapStatus, ctaphid::Ctaphid};
 
 pub mod client_pin;
 pub mod get_assertion;
@@ -19,7 +19,23 @@ pub fn dispatch(
     channel: Channel,
     cbor: &[u8],
 ) -> anyhow::Result<()> {
-    let request = Request::deserialize(cbor).unwrap();
+    // Anything on the wire can be malformed, and the HID device is reachable
+    // by the logged-in user; never unwrap a request.
+    let request = match Request::deserialize(cbor) {
+        Ok(request) => request,
+        Err(e) => {
+            error!("Cannot parse CTAP request: {e:?}");
+            let status = match e {
+                ctap2::Error::InvalidCommand => CtapStatus::InvalidCommand,
+                ctap2::Error::MissingParameter => CtapStatus::MissingParameter,
+                ctap2::Error::CborUnexpectedType => CtapStatus::CborUnexpectedType,
+                _ => CtapStatus::InvalidCbor,
+            };
+            hid.send_cbor_status(channel, status)?;
+            return Ok(());
+        }
+    };
+
     let cmd_name = get_request_name(&request);
 
     debug!(
@@ -27,18 +43,23 @@ pub fn dispatch(
         cmd_name, channel
     );
 
-    let result = match Request::deserialize(cbor).unwrap() {
+    let result = match request {
         Request::GetInfo => get_info::handle(hid, config, channel),
         Request::MakeCredential(req) => make_credential::handle(hid, config, channel, req),
         Request::GetAssertion(req) => get_assertion::handle(hid, config, channel, req),
         Request::GetNextAssertion => get_next_assertion::handle(hid, config, channel),
-        Request::ClientPin(req) => client_pin::handle(hid, config, channel, req), // todo!()
+        Request::ClientPin(req) => client_pin::handle(hid, config, channel, req),
         Request::Reset => reset::handle(hid, config, channel),
         Request::Selection => selection::handle(hid, config, channel),
-        Request::CredentialManagement(_) => todo!(),
-        Request::LargeBlobs(_) => todo!(),
-        Request::Vendor(_) => unreachable!(),
-        _ => unreachable!("This command is not supported yet"),
+
+        // Commands this authenticator does not implement. GetInfo advertises
+        // none of them, so a well-behaved platform will not send them; answer
+        // with an error instead of panicking if one does.
+        Request::CredentialManagement(_) | Request::LargeBlobs(_) | Request::Vendor(_) | _ => {
+            debug!("Unsupported CTAP instruction: '{}'", cmd_name);
+            hid.send_cbor_status(channel, CtapStatus::UnsupportedOption)?;
+            Ok(())
+        }
     };
 
     if result.is_ok() {

@@ -1,9 +1,11 @@
-use anyhow::Ok;
 use ctaphid_types::{Channel, DeviceError, Packet};
 use log::{debug, error};
 use rand::{RngCore, rng};
 
-use crate::ctaphid::{ctaphid::Ctaphid, hid::OutputEvent};
+use crate::ctaphid::{
+    ctaphid::{Ctaphid, parse_report},
+    hid::OutputEvent,
+};
 
 pub fn generate_new_cid() -> Channel {
     let mut cid = [0u8; 4];
@@ -15,64 +17,80 @@ pub fn collect_all_packet(
     ctaphid: &mut Ctaphid,
     // payload_buffer: &mut Vec<u8>,
     // next_sequence: u8,
-) -> anyhow::Result<()> {
-    let event = ctaphid.hid.read().expect("Failed to read hid events");
-    if let OutputEvent::Output { data: report_bytes } = event {
-        let raw_payload = &report_bytes[1..];
-        let ctaphid_packet: Packet<Vec<u8>> = Packet::try_from(raw_payload).unwrap();
-        match ctaphid_packet {
-            Packet::Continuation(continuation_packet) => {
-                let channel_payload = ctaphid
-                    .payload_stack
-                    .get_mut(&continuation_packet.channel.into())
-                    .ok_or_else(|| {
-                        error!("Invalid channel received: {}", continuation_packet.channel);
-                        DeviceError::InvalidChannel
-                    })?;
+) -> anyhow::Result<bool> {
+    let event = ctaphid.hid.read()?;
 
-                if continuation_packet.sequence != channel_payload.next_expected_sequence {
-                    println!(
-                        "Sequence mismatch: received {}, expected {}",
-                        continuation_packet.sequence, channel_payload.next_expected_sequence
-                    );
-                    anyhow::bail!(DeviceError::InvalidSequence);
-                }
+    let OutputEvent::Output { data: report_bytes } = event else {
+        ctaphid.event_handler(event)?;
+        return Ok(false);
+    };
 
-                let remaining_bytes = channel_payload.data.capacity() - channel_payload.data.len();
-                let chunk_size = continuation_packet.data.len().min(remaining_bytes);
-                channel_payload
-                    .data
-                    .extend_from_slice(&continuation_packet.data[..chunk_size]);
-
-                debug!(
-                    "[Packet Collector] [Channel: {}]: Seq: {}, Accumulated {}/{} bytes",
-                    continuation_packet.channel,
-                    continuation_packet.sequence,
-                    channel_payload.data.len(),
-                    channel_payload.data.capacity()
-                );
-
-                if channel_payload.data.len() >= channel_payload.data.capacity() {
-                    debug!(
-                        "[Packet Collector] [Channel: {}]: All packets have been accumulated.",
-                        continuation_packet.channel
-                    );
-                    Ok(())
-                } else {
-                    // recursively collect more packets
-                    channel_payload.next_expected_sequence += 1;
-                    collect_all_packet(ctaphid)
-                }
+    let ctaphid_packet: Packet<Vec<u8>> = match parse_report(&report_bytes) {
+        Ok(packet) => packet,
+        Err(malformed) => {
+            error!("Malformed CTAPHID report: {:?}", malformed.err);
+            if let Some(channel) = malformed.channel {
+                ctaphid.send_portocal_error(channel, malformed.err)?;
             }
-            Packet::Initialization(_) => {
-                // In case an initialization packet is received while collecting continuation packets
-                ctaphid.event_handler(OutputEvent::Output { data: report_bytes })?;
-                Ok(())
+            return Ok(false);
+        }
+    };
+
+    match ctaphid_packet {
+        Packet::Continuation(continuation_packet) => {
+            let channel_payload = ctaphid
+                .payload_stack
+                .get_mut(&continuation_packet.channel.into())
+                .ok_or_else(|| {
+                    error!("Invalid channel received: {}", continuation_packet.channel);
+                    DeviceError::InvalidChannel
+                })?;
+
+            if continuation_packet.sequence != channel_payload.next_expected_sequence {
+                error!(
+                    "Sequence mismatch: received {}, expected {}",
+                    continuation_packet.sequence, channel_payload.next_expected_sequence
+                );
+                anyhow::bail!(DeviceError::InvalidSequence);
+            }
+
+            let remaining_bytes = channel_payload.data.capacity() - channel_payload.data.len();
+            let chunk_size = continuation_packet.data.len().min(remaining_bytes);
+            channel_payload
+                .data
+                .extend_from_slice(&continuation_packet.data[..chunk_size]);
+
+            debug!(
+                "[Packet Collector] [Channel: {}]: Seq: {}, Accumulated {}/{} bytes",
+                continuation_packet.channel,
+                continuation_packet.sequence,
+                channel_payload.data.len(),
+                channel_payload.data.capacity()
+            );
+
+            if channel_payload.data.len() >= channel_payload.data.capacity() {
+                debug!(
+                    "[Packet Collector] [Channel: {}]: All packets have been accumulated.",
+                    continuation_packet.channel
+                );
+                Ok(true)
+            } else {
+                // recursively collect more packets
+                channel_payload.next_expected_sequence += 1;
+                collect_all_packet(ctaphid)
             }
         }
-    } else {
-        ctaphid.event_handler(event)?;
-        Ok(())
+        Packet::Initialization(_) => {
+            // A new request arrived while we were still collecting this one.
+            // Let the dispatcher handle it, then report the channel as busy;
+            // dropping it silently leaves the host waiting for a response.
+            if let Some((other_channel, _)) =
+                ctaphid.event_handler(OutputEvent::Output { data: report_bytes })?
+            {
+                ctaphid.send_portocal_error(other_channel, DeviceError::ChannelBusy)?;
+            }
+            Ok(false)
+        }
     }
 }
 

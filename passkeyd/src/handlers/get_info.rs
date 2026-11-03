@@ -1,5 +1,5 @@
-use ctap_types::{ctap2::get_info, serde::cbor_serialize};
-use ctaphid_types::{Channel, Command};
+use ctap_types::ctap2::get_info;
+use ctaphid_types::Channel;
 use passkeyd_abi::config::Config;
 
 use crate::ctaphid::ctaphid::Ctaphid;
@@ -23,11 +23,8 @@ pub fn handle(hid: &mut Ctaphid, _config: &Config, channel: Channel) -> anyhow::
     options.plat = Some(true);
 
     response.options = Some(options);
-    // response.pin_protocols = Some(ctap_types::Vec::from_iter([1]));
-    let mut serialized_data = [0u8; size_of::<get_info::Response>() + 1];
-    let serialized_cbor = cbor_serialize(&response, &mut serialized_data[1..])?;
-    let length = serialized_cbor.len();
-    let final_cbor = &mut serialized_data[..length + 1];
-    hid.send_64response(channel, Command::Cbor, final_cbor)?;
-    Ok(())
+
+    // send_cbor() frames the response properly. send_64response() tops out at
+    // a single 64-byte report, which this response is already close to.
+    hid.send_cbor(channel, response)
 }

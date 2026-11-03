@@ -26,6 +26,24 @@ pub enum StreamError {
     UnknownEventType(u32),
 }
 
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error on the UHID device: {e}"),
+            Self::UnknownEventType(t) => write!(f, "unknown UHID event type {t}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::UnknownEventType(_) => None,
+        }
+    }
+}
+
 /// Each of these flags defines whether a given report-type uses numbered reports.
 /// If numbered reports are used for a type, all messages from the kernel already have the report-number as prefix. Otherwise, no prefix is added by the kernel.
 /// For messages sent by user-space to the kernel, you must adjust the prefixes according to these flags.

@@ -21,6 +21,10 @@ pub enum CtapStatus {
     #[error("Success")]
     Ok = 0x00,
 
+    // CTAP1 / transport errors, reported for requests we cannot parse
+    #[error("Invalid command")]
+    InvalidCommand = 0x01,
+
     // CTAP2 CBOR / request errors
     #[error("Unexpected CBOR type")]
     CborUnexpectedType = 0x11,

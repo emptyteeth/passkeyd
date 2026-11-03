@@ -1,10 +1,8 @@
-use anyhow::Ok;
 use ctap_types::serde::cbor_serialize_to;
 use ctaphid_types::{
     Capabilities, Channel, Command, DeviceError, DeviceVersion, InitResponse, InitializationPacket,
     Message, Packet,
 };
-use p256::{ecdh::EphemeralSecret, elliptic_curve::rand_core::OsRng};
 use passkeyd_abi::utils::CborVec;
 use std::{collections::HashMap, fs::File, time::{Duration, Instant}};
 
@@ -34,10 +32,40 @@ pub struct ChannelPayload {
     pub next_expected_sequence: u8,
 }
 
+/// A report that cannot be parsed as a CTAPHID packet.
+pub(crate) struct Malformed {
+    /// Best guess at the channel, if the report was long enough to carry one.
+    pub channel: Option<Channel>,
+    pub err: DeviceError,
+}
+
+/// Splits a UHID output report into the CTAPHID payload and parses the packet.
+///
+/// The first byte of the report is the HID report id, which CTAPHID never sees.
+/// Keeping this apart from `event_handler` makes the untrusted-input boundary
+/// testable without a HID device.
+pub(crate) fn parse_report(report_bytes: &[u8]) -> Result<Packet<Vec<u8>>, Malformed> {
+    let Some(payload) = report_bytes.get(1..) else {
+        return Err(Malformed {
+            channel: None,
+            err: DeviceError::InvalidLength,
+        });
+    };
+
+    let channel = payload
+        .get(..4)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(Channel::from);
+
+    Packet::try_from(payload).map_err(|_| Malformed {
+        channel,
+        err: DeviceError::InvalidLength,
+    })
+}
+
 pub struct Ctaphid {
     pub hid: hid::UHIDDevice<File>,
     pub payload_stack: HashMap<HashableChannel, ChannelPayload>,
-    pub ephemeral_secret: p256::ecdh::EphemeralSecret,
     cancelled: HashMap<HashableChannel, bool>,
 }
 
@@ -45,12 +73,9 @@ impl Ctaphid {
     pub fn new() -> Self {
         debug!("HID created!");
 
-        let secret_key = EphemeralSecret::random(&mut OsRng);
-
         Self {
             hid: hid::create_hid().expect("Failed to create HID, are you root?"),
             payload_stack: HashMap::with_capacity(10),
-            ephemeral_secret: secret_key,
             cancelled: HashMap::with_capacity(10),
         }
     }
@@ -67,7 +92,7 @@ impl Ctaphid {
     }
 
     pub fn get_webauthn(&mut self) -> ReturnEvent {
-        let event = self.hid.read().expect("Failed to read events");
+        let event = self.hid.read()?;
         self.event_handler(event)
     }
 
@@ -76,8 +101,17 @@ impl Ctaphid {
             return Ok(None);
         };
 
-        let raw_payload = &report_bytes[1..];
-        let ctaphid_packet: Packet<Vec<u8>> = Packet::try_from(raw_payload).unwrap();
+        let ctaphid_packet = match parse_report(&report_bytes) {
+            Ok(packet) => packet,
+            Err(malformed) => {
+                error!("Malformed CTAPHID report: {:?}", malformed.err);
+                if let Some(channel) = malformed.channel {
+                    self.send_portocal_error(channel, malformed.err)?;
+                }
+                return Ok(None);
+            }
+        };
+
         match ctaphid_packet {
             Packet::Initialization(mut init_packet) => {
                 debug!("Received initialization payload.");
@@ -102,13 +136,24 @@ impl Ctaphid {
 
                 if channel_payload.data.len() < channel_payload.data.capacity() {
                     debug!("Initialization payload is incomplete, collecting additional packets.");
-                    if let Err(err) = collect_all_packet(self) {
-                        let device_error = err
-                            .downcast_ref::<DeviceError>()
-                            .copied()
-                            .unwrap_or(DeviceError::Other);
-                        self.send_portocal_error(init_packet.channel, device_error)?;
-                        return Ok(None);
+                    match collect_all_packet(self) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // Interrupted by a malformed packet or by another
+                            // request. The payload is incomplete, so it must
+                            // not be dispatched as if it were whole.
+                            self.payload_stack.remove(&init_packet.channel.into());
+                            return Ok(None);
+                        }
+                        Err(err) => {
+                            let device_error = err
+                                .downcast_ref::<DeviceError>()
+                                .copied()
+                                .unwrap_or(DeviceError::Other);
+                            self.payload_stack.remove(&init_packet.channel.into());
+                            self.send_portocal_error(init_packet.channel, device_error)?;
+                            return Ok(None);
+                        }
                     }
                     debug!("Additional packets have been collected.");
                 }
@@ -124,10 +169,17 @@ impl Ctaphid {
                     completed_payload.data,
                 )
             }
-            // Continuation packets will be captured via collect_all_packet().
-            // This code should only run if a continuous packet throws an error,
-            // in which case the next sequence packet would be caught up here.
-            Packet::Continuation(_) => unreachable!(),
+            // Continuation packets are collected by collect_all_packet(). One
+            // reaching this point has no initialization packet to belong to,
+            // typically because the transaction before it was cancelled.
+            Packet::Continuation(continuation) => {
+                error!(
+                    "Unexpected continuation packet on channel {}",
+                    continuation.channel
+                );
+                self.send_portocal_error(continuation.channel, DeviceError::InvalidSequence)?;
+                return Ok(None);
+            }
         }
     }
 
@@ -163,8 +215,16 @@ impl Ctaphid {
                 // }
                 // let channel = Some(generate_new_cid());
 
+                // The nonce is the first word of the payload; a short one is a
+                // malformed request, not something to index into.
+                let Some(nonce) = data.get(..8).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                else {
+                    self.send_portocal_error(channel, DeviceError::InvalidLength)?;
+                    return Ok(None);
+                };
+
                 let init_reply = InitResponse {
-                    nonce: data[0..8].try_into()?,
+                    nonce,
                     channel: generate_new_cid(),
                     protocol_version: 0x02,
                     device_version: DeviceVersion {
@@ -202,7 +262,14 @@ impl Ctaphid {
 
             // If it is reached, it means Chromium fallbacked to the legacy nmsg due to an error in CTAP communication.
             // However, even with the fallback, it won't be reached.
-            Command::KeepAlive => unreachable!(),
+            //
+            // KEEPALIVE is only ever sent by the authenticator. Anything else
+            // that gets here is a command we do not implement, and the spec's
+            // answer for that is CTAPHID_ERR_INVALID_CMD.
+            Command::KeepAlive | Command::Unknown(_) | Command::Vendor(_) => {
+                error!("Unsupported CTAPHID command {:?} on channel {}", command, channel);
+                self.send_portocal_error(channel, DeviceError::InvalidCommand)?;
+            }
             Command::Lock => {
                 self.send_64response(channel, Command::Lock, [])?;
             }
@@ -215,8 +282,6 @@ impl Ctaphid {
                 // }
                 self.send_64response(channel, Command::Unknown(0x83), [0x6D, 0x00])?;
             }
-            Command::Unknown(_) => unimplemented!(),
-            Command::Vendor(_) => unimplemented!(),
             Command::Wink => {
                 self.send_64response(channel, Command::Wink, [])?;
             }
@@ -282,9 +347,11 @@ impl Ctaphid {
             command,
             data,
         };
-        let fragements = message.fragments(64).unwrap();
+        let fragments = message
+            .fragments(64)
+            .map_err(|e| anyhow::anyhow!("Failed to fragment CTAPHID response: {e}"))?;
         let mut report = [0u8; 64];
-        for packet in fragements {
+        for packet in fragments {
             packet.serialize(&mut report)?;
             self.hid.write(&report)?;
         }
@@ -364,5 +431,35 @@ mod keepalive_tests {
         assert_eq!(&report[5..7], &[0x00, 0x01]);
         assert_eq!(report[7], 0x01);
         assert!(report[8..].iter().all(|b| *b == 0), "padding must be zero");
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// Reports are written by another process. No length or content may make
+    /// parsing panic: a panic aborts the daemon and every ceremony with it.
+    #[test]
+    fn parsing_arbitrary_reports_never_panics() {
+        for len in 0..=72usize {
+            for pattern in [0x00u8, 0x3B, 0x80, 0xFF] {
+                let report: Vec<u8> = (0..len)
+                    .map(|i| pattern.wrapping_add(i as u8))
+                    .collect();
+                let _ = parse_report(&report);
+            }
+        }
+    }
+
+    #[test]
+    fn a_report_without_a_payload_is_malformed() {
+        assert!(matches!(
+            parse_report(&[]),
+            Err(Malformed {
+                err: DeviceError::InvalidLength,
+                channel: None,
+            })
+        ));
     }
 }
