@@ -4,7 +4,7 @@ use crate::{
 };
 use ctap_types::{ctap2::get_assertion, serde::cbor_serialize_to};
 use ctaphid_types::{Channel, Command};
-use log::debug;
+use log::{debug, info};
 use passkeyd_abi::config::Config;
 
 pub fn handle(
@@ -13,6 +13,19 @@ pub fn handle(
     channel: Channel,
     req: get_assertion::Request<'_>,
 ) -> anyhow::Result<()> {
+    // One line per ceremony. Firefox has been seen asking twice in a row on
+    // some sites; the request shape is what tells the two calls apart.
+    info!(
+        "GetAssertion: rp={}, allow_list={}, options(up,uv,rk)={:?}, cdh={:02x?}",
+        req.rp_id,
+        match req.allow_list.as_ref() {
+            Some(list) => list.len().to_string(),
+            None => "discoverable".to_string(),
+        },
+        req.options.as_ref().map(|o| (o.up, o.uv, o.rk)),
+        &req.client_data_hash[..req.client_data_hash.len().min(4)],
+    );
+
     let response = cerds::get::get(hid, channel, config, req);
     let mut report = [0u8; size_of::<get_assertion::Response>() + 1]; //approx size.
 

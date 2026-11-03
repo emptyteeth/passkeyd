@@ -1,5 +1,6 @@
 use ctap_types::serde::cbor_serialize_to;
 use ctaphid_types::{Channel, Command};
+use log::info;
 use passkeyd_abi::config::Config;
 
 use crate::{
@@ -13,6 +14,16 @@ pub fn handle(
     channel: Channel,
     req: ctap_types::ctap2::make_credential::Request<'_>,
 ) -> anyhow::Result<()> {
+    // One line per ceremony, so a doubled prompt can be told apart from a
+    // doubled request.
+    info!(
+        "MakeCredential: rp={}, user={:?}, options(up,uv,rk)={:?}, exclude_list={}",
+        req.rp.id,
+        req.user.name.as_deref(),
+        req.options.as_ref().map(|o| (o.up, o.uv, o.rk)),
+        req.exclude_list.as_ref().map_or(0, |list| list.len()),
+    );
+
     let response = cerds::make::make(hid, channel, config, req);
     let mut report = [0u8; size_of::<ctap_types::ctap2::make_credential::Response>() + 1];
 
