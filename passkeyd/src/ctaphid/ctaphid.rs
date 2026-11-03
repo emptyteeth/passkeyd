@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs::File, time::{Duration, Instant}};
 use crate::ctaphid::{
     CtapStatus,
     hid::OutputEvent,
-    utils::{collect_all_packet, device_err_into_bytes, generate_new_cid},
+    utils::{collect_all_packet, device_err_into_bytes, generate_new_cid, MAX_MESSAGE_SIZE},
 };
 
 use log::{debug, error};
@@ -91,6 +91,14 @@ impl Ctaphid {
             .unwrap_or(false)
     }
 
+    /// Forget a cancellation once the transaction on that channel is over.
+    ///
+    /// Without this, every cancelled request leaves an entry behind for the
+    /// life of the daemon.
+    pub fn clear_cancelled(&mut self, channel: Channel) {
+        self.cancelled.remove(&channel.into());
+    }
+
     pub fn get_webauthn(&mut self) -> ReturnEvent {
         let event = self.hid.read()?;
         self.event_handler(event)
@@ -115,6 +123,16 @@ impl Ctaphid {
         match ctaphid_packet {
             Packet::Initialization(mut init_packet) => {
                 debug!("Received initialization payload.");
+
+                let message_size = init_packet.length as usize;
+                if message_size > MAX_MESSAGE_SIZE {
+                    error!(
+                        "CTAPHID message of {} bytes exceeds the maximum of {}",
+                        message_size, MAX_MESSAGE_SIZE
+                    );
+                    self.send_portocal_error(init_packet.channel, DeviceError::InvalidLength)?;
+                    return Ok(None);
+                }
 
                 self.payload_stack.insert(
                     init_packet.channel.into(),

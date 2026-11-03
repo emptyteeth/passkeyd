@@ -1,6 +1,6 @@
 use ctap_types::serde::cbor_serialize_to;
 use ctaphid_types::{Channel, Command};
-use log::info;
+use log::{error, info};
 use passkeyd_abi::config::Config;
 
 use crate::{
@@ -29,7 +29,16 @@ pub fn handle(
 
     match response {
         Ok(res) => {
-            let size = cbor_serialize_to(&res, &mut report[1..])?;
+            let size = match cbor_serialize_to(&res, &mut report[1..]) {
+                Ok(size) => size,
+                Err(e) => {
+                    // The host is waiting on this request. Answer it, even when
+                    // the answer could not be built.
+                    error!("Failed to serialize the MakeCredential response: {e:?}");
+                    hid.send_cbor_status(channel, CtapStatus::Other)?;
+                    return Ok(());
+                }
+            };
             let final_cbor = &mut report[..size + 1];
             hid.send_response(channel, Command::Cbor, final_cbor)?;
         }

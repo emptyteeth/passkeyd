@@ -18,9 +18,14 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         if let Some((channel, cbor)) = hid.get_webauthn()? {
+            // A CANCEL that arrived while nothing was in flight means nothing;
+            // it must not cancel the transaction that starts now.
+            hid.clear_cancelled(channel);
             if let Err(e) = handlers::dispatch(&mut hid, &config, channel, &cbor) {
                 error!("Error handling CTAP request: {e}");
             }
+            // The transaction is over, one way or another, so forget the rest.
+            hid.clear_cancelled(channel);
             debug!("Transaction completed on channel {channel}");
         }
     }

@@ -7,10 +7,20 @@ use crate::ctaphid::{
     hid::OutputEvent,
 };
 
+/// The largest CTAPHID message: one initialization packet plus 128
+/// continuation packets (57 + 128 * 59).
+pub const MAX_MESSAGE_SIZE: usize = 7609;
+
 pub fn generate_new_cid() -> Channel {
-    let mut cid = [0u8; 4];
-    rng().fill_bytes(&mut cid);
-    Channel::from(cid)
+    loop {
+        let mut cid = [0u8; 4];
+        rng().fill_bytes(&mut cid);
+
+        // Zero and all-ones are reserved; the latter is the broadcast channel.
+        if cid != [0x00; 4] && cid != [0xFF; 4] {
+            return Channel::from(cid);
+        }
+    }
 }
 
 pub fn collect_all_packet(
