@@ -100,11 +100,41 @@ impl AuthorizationUI {
 pub struct FingerprintUI {
     /// Set when the daemon reports a failed match, to nudge the user to retry.
     pub retry: bool,
+    /// Set for a moment on every failed read. Once the icon is already red,
+    /// another failure would otherwise look like nothing happened at all, and
+    /// the user cannot tell whether their finger was even seen.
+    flash_until: Option<std::time::Instant>,
 }
+
+/// How long the icon blinks back to its normal colour on each failed read.
+pub const FLASH: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub enum FingerprintResponse {
     Deny,
+}
+
+impl FingerprintUI {
+    /// Records a failed read: keep the icon red and blink it once.
+    pub fn failed_attempt(&mut self) {
+        self.retry = true;
+        self.flash_until = Some(std::time::Instant::now() + FLASH);
+    }
+
+    /// Ends a blink, unless a newer failed read has already started another.
+    pub fn end_flash(&mut self) {
+        if self
+            .flash_until
+            .is_some_and(|until| std::time::Instant::now() >= until)
+        {
+            self.flash_until = None;
+        }
+    }
+
+    /// Whether a blink is running right now.
+    pub fn blinking(&self) -> bool {
+        self.flash_until.is_some()
+    }
 }
 
 impl FingerprintUI {
@@ -127,8 +157,10 @@ impl FingerprintUI {
 
         // Where the password prompt has a field to aim at, this screen has
         // nothing — so it gets a mark to aim at instead. It turns red when a
-        // read fails, to say "again" without needing to be read.
-        let mark_class = if self.retry {
+        // read fails, to say "again" without needing to be read. A blink
+        // briefly returns it to the normal colour first, so a second failure
+        // is still something the user can see.
+        let mark_class = if self.retry && !self.blinking() {
             theme::SymbolClass::Error
         } else {
             theme::SymbolClass::Normal

@@ -8,7 +8,7 @@ use iced::{
 use zeroize::Zeroize;
 
 use crate::{
-    authorize::{AuthorizationUI, FingerprintResponse, FingerprintUI},
+    authorize::{AuthorizationUI, FLASH, FingerprintResponse, FingerprintUI},
     ipc::Incoming,
     select::SelectionUI,
 };
@@ -37,6 +37,8 @@ pub enum MessageBridge {
     Incoming(Incoming),
     /// The desktop switched between light and dark.
     SystemTheme(iced::theme::Mode),
+    /// A fingerprint blink has run its course.
+    EndFlash,
 }
 
 struct StateMachine {
@@ -107,18 +109,38 @@ impl StateMachine {
                 theme::set_system_mode(mode);
                 Task::none()
             }
+
+            MessageBridge::EndFlash => {
+                if let Flow::AwaitingFingerprint(fingerprint) = &mut self.flow {
+                    fingerprint.end_flash();
+                }
+                Task::none()
+            }
         }
     }
 
     fn apply_service_message(&mut self, message: ServiceMessage) -> Task<MessageBridge> {
         match message {
             ServiceMessage::Retry => {
-                match &mut self.flow {
-                    Flow::Authorizing(authorize) => authorize.is_invalid = true,
-                    Flow::AwaitingFingerprint(fingerprint) => fingerprint.retry = true,
-                    Flow::Selecting(_) => {}
+                let blinking = match &mut self.flow {
+                    Flow::Authorizing(authorize) => {
+                        authorize.is_invalid = true;
+                        false
+                    }
+                    Flow::AwaitingFingerprint(fingerprint) => {
+                        fingerprint.failed_attempt();
+                        true
+                    }
+                    Flow::Selecting(_) => false,
+                };
+
+                if blinking {
+                    // Every failed read gets its own blink, so a second failure
+                    // is visible even though the icon is already red.
+                    after(FLASH, MessageBridge::EndFlash)
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
             ServiceMessage::FallbackToPassword(reason) => {
                 self.flow = Flow::Authorizing(AuthorizationUI::fallback(reason));
@@ -161,6 +183,20 @@ impl StateMachine {
     fn subscription(&self) -> iced::Subscription<MessageBridge> {
         iced::system::theme_changes().map(MessageBridge::SystemTheme)
     }
+}
+
+/// Emits `message` after `delay`.
+///
+/// iced's default executor here is the thread pool, which provides no timer
+/// subscription; sleeping on an executor thread would stall the UI. A thread
+/// feeding a one-shot channel is the same pattern `ipc` uses.
+fn after(delay: std::time::Duration, message: MessageBridge) -> Task<MessageBridge> {
+    let (mut sender, receiver) = iced::futures::channel::mpsc::channel(1);
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = sender.try_send(message);
+    });
+    Task::run(receiver, |message| message)
 }
 
 /// Starts listening to the daemon. Called exactly once, from `boot`.
