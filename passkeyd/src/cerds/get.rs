@@ -43,16 +43,54 @@ pub fn get(
     let uid = active_uid().ok_or(CtapStatus::UvBlocked)?;
 
     let (rp_entity, mut passkeys) = load_passkeys(&req, uid)?;
-    let action = authorization_action(has_another_fido_device(), config.no_pass, passkeys.len());
-    let authorized_index = authorize(hid, channel, config, uid, &rp_entity, &passkeys, action)?;
+
+    // A client may ask for an assertion with user presence explicitly turned
+    // off. That is how Firefox probes for a passkey before running the real
+    // ceremony (its conditional/autofill UI, and Chromium does the same): it
+    // only wants to know whether the credential is here. A hardware key answers
+    // such a request without a touch, so prompting here costs the user a
+    // second, pointless verification for one login.
+    //
+    // Answer without a UI, and leave UP and UV clear in the authenticator data:
+    // nothing was verified, and the relying party must be able to see that.
+    let silent = req
+        .options
+        .as_ref()
+        .is_some_and(|options| options.up == Some(false) && options.uv != Some(true));
+
+    let authorized_index = if silent {
+        info!("GetAssertion: user presence not requested, answering without a prompt");
+        if passkeys.is_empty() {
+            anyhow::bail!(CtapStatus::NoCredentials);
+        }
+        // Any credential will do for a discovery probe; with an allow list this
+        // is the only candidate.
+        0
+    } else {
+        let action = authorization_action(has_another_fido_device(), config.no_pass, passkeys.len());
+        info!(
+            "GetAssertion: {} candidate passkey(s) for uid {}, action {:?}",
+            passkeys.len(),
+            uid,
+            action
+        );
+        authorize(hid, channel, config, uid, &rp_entity, &passkeys, action)?
+    };
+
     let authorized_passkey = passkeys.swap_remove(authorized_index);
 
     let rp_id_hash = sha2::Sha256::digest(req.rp_id.as_bytes()).into();
 
+    let flags = if silent {
+        AuthenticatorDataFlags::empty()
+    } else {
+        AuthenticatorDataFlags::USER_VERIFIED | AuthenticatorDataFlags::USER_PRESENCE
+    };
+
     let authenticator_data = AuthenticatorData {
         attested_credential_data: None,
         extensions: None,
-        flags: AuthenticatorDataFlags::USER_VERIFIED | AuthenticatorDataFlags::USER_PRESENCE,
+        flags,
         rp_id_hash: &rp_id_hash,
         sign_count: authorized_passkey.sign_count + 1,
     };
@@ -133,6 +171,7 @@ fn load_passkeys(
     Ok((rp_entity, passkeys))
 }
 
+#[derive(Debug)]
 enum AuthorizationAction {
     // Skip the authorization UI entirely, including password
     // and credential selection.
