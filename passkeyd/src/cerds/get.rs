@@ -58,14 +58,14 @@ pub fn get(
         .as_ref()
         .is_some_and(|options| options.up == Some(false) && options.uv != Some(true));
 
-    let authorized_index = if silent {
+    let (authorized_index, selected_by_user) = if silent {
         info!("GetAssertion: user presence not requested, answering without a prompt");
         if passkeys.is_empty() {
             anyhow::bail!(CtapStatus::NoCredentials);
         }
         // Any credential will do for a discovery probe; with an allow list this
         // is the only candidate.
-        0
+        (0, false)
     } else {
         let action = authorization_action(has_another_fido_device(), config.no_pass, passkeys.len());
         info!(
@@ -74,7 +74,10 @@ pub fn get(
             uid,
             action
         );
-        authorize(hid, channel, config, uid, &rp_entity, &passkeys, action)?
+        // The user picked from a list, unless there was no list to pick from.
+        let selected_by_user = !matches!(action, AuthorizationAction::UseOnlyPasskey);
+        let index = authorize(hid, channel, config, uid, &rp_entity, &passkeys, action)?;
+        (index, selected_by_user)
     };
 
     let authorized_passkey = passkeys.swap_remove(authorized_index);
@@ -123,12 +126,28 @@ pub fn get(
     //      }
     // }
 
-    response.user = Some(authorized_passkey.credential_source.other_ui.user.clone());
+    // The user entity identifies the account. Without user verification, only
+    // the user handle may be returned: name, display name and icon are
+    // user-identifiable information the spec forbids in a silent response.
+    let mut user = authorized_passkey
+        .credential_source
+        .other_ui
+        .user
+        .clone();
+    if silent {
+        user.name = None;
+        user.display_name = None;
+        user.icon = None;
+    }
+    response.user = Some(user);
 
+    // `userSelected` says the credential was picked by the user on the
+    // authenticator. It must not be present when the platform supplied an
+    // allowList: there the credential is already determined.
     response.user_selected = match &req.allow_list {
-        Some(list) if list.len() > 1 => Some(true),
-        Some(list) if list.len() == 1 => None,
-        None | Some(_) => None, //firefox wants None.
+        Some(_) => None,
+        None if selected_by_user => Some(true),
+        None => None,
     };
 
     authorized_passkey.sign_increment(rp_entity);
