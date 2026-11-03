@@ -1,7 +1,7 @@
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use ctaphid_types::{Channel, DeviceError, Packet};
+use ctaphid_types::{Channel, Command, DeviceError, Packet};
 use log::{debug, error};
 use rand::{RngCore, rng};
 
@@ -89,87 +89,99 @@ fn read_event(ctaphid: &mut Ctaphid, deadline: Instant) -> anyhow::Result<Option
     }
 }
 
-pub fn collect_all_packet(ctaphid: &mut Ctaphid) -> anyhow::Result<Collected> {
-    collect_until(ctaphid, Instant::now() + MESSAGE_TIMEOUT)
+pub fn collect_all_packet(ctaphid: &mut Ctaphid, channel: Channel) -> anyhow::Result<Collected> {
+    collect_until(ctaphid, channel, Instant::now() + MESSAGE_TIMEOUT)
 }
 
-fn collect_until(ctaphid: &mut Ctaphid, deadline: Instant) -> anyhow::Result<Collected> {
-    let Some(event) = read_event(ctaphid, deadline)? else {
-        error!("Timed out waiting for the rest of a CTAPHID message");
-        return Ok(Collected::TimedOut);
-    };
+fn collect_until(
+    ctaphid: &mut Ctaphid,
+    channel: Channel,
+    deadline: Instant,
+) -> anyhow::Result<Collected> {
+    loop {
+        let Some(event) = read_event(ctaphid, deadline)? else {
+            error!("Timed out waiting for the rest of a CTAPHID message");
+            return Ok(Collected::TimedOut);
+        };
 
-    let OutputEvent::Output { data: report_bytes } = event else {
-        // Device open/close/start/stop: not data, and no reason to abandon
-        // the message.
-        ctaphid.event_handler(event)?;
-        return collect_until(ctaphid, deadline);
-    };
+        let OutputEvent::Output { data: report_bytes } = event else {
+            // Device open/close/start/stop: not data, and no reason to
+            // abandon the message.
+            ctaphid.event_handler(event)?;
+            continue;
+        };
 
-    let ctaphid_packet: Packet<Vec<u8>> = match parse_report(&report_bytes) {
-        Ok(packet) => packet,
-        Err(malformed) => {
-            error!("Malformed CTAPHID report: {:?}", malformed.err);
-            if let Some(channel) = malformed.channel {
-                ctaphid.send_portocal_error(channel, malformed.err)?;
+        let ctaphid_packet: Packet<Vec<u8>> = match parse_report(&report_bytes) {
+            Ok(packet) => packet,
+            Err(malformed) => {
+                error!("Malformed CTAPHID report: {:?}", malformed.err);
+                if let Some(channel) = malformed.channel {
+                    ctaphid.send_portocal_error(channel, malformed.err)?;
+                }
+                return Ok(Collected::Interrupted);
             }
-            return Ok(Collected::Interrupted);
-        }
-    };
+        };
 
-    match ctaphid_packet {
-        Packet::Continuation(continuation_packet) => {
-            let channel_payload = ctaphid
-                .payload_stack
-                .get_mut(&continuation_packet.channel.into())
-                .ok_or_else(|| {
-                    error!("Invalid channel received: {}", continuation_packet.channel);
-                    DeviceError::InvalidChannel
-                })?;
+        match ctaphid_packet {
+            Packet::Continuation(continuation_packet) => {
+                let channel_payload = ctaphid
+                    .payload_stack
+                    .get_mut(&continuation_packet.channel.into())
+                    .ok_or_else(|| {
+                        error!("Invalid channel received: {}", continuation_packet.channel);
+                        DeviceError::InvalidChannel
+                    })?;
 
-            if continuation_packet.sequence != channel_payload.next_expected_sequence {
-                error!(
-                    "Sequence mismatch: received {}, expected {}",
-                    continuation_packet.sequence, channel_payload.next_expected_sequence
-                );
-                anyhow::bail!(DeviceError::InvalidSequence);
-            }
+                if continuation_packet.sequence != channel_payload.next_expected_sequence {
+                    error!(
+                        "Sequence mismatch: received {}, expected {}",
+                        continuation_packet.sequence, channel_payload.next_expected_sequence
+                    );
+                    anyhow::bail!(DeviceError::InvalidSequence);
+                }
 
-            let remaining_bytes = channel_payload.data.capacity() - channel_payload.data.len();
-            let chunk_size = continuation_packet.data.len().min(remaining_bytes);
-            channel_payload
-                .data
-                .extend_from_slice(&continuation_packet.data[..chunk_size]);
+                let remaining_bytes = channel_payload.data.capacity() - channel_payload.data.len();
+                let chunk_size = continuation_packet.data.len().min(remaining_bytes);
+                channel_payload
+                    .data
+                    .extend_from_slice(&continuation_packet.data[..chunk_size]);
 
-            debug!(
-                "[Packet Collector] [Channel: {}]: Seq: {}, Accumulated {}/{} bytes",
-                continuation_packet.channel,
-                continuation_packet.sequence,
-                channel_payload.data.len(),
-                channel_payload.data.capacity()
-            );
-
-            if channel_payload.data.len() >= channel_payload.data.capacity() {
                 debug!(
-                    "[Packet Collector] [Channel: {}]: All packets have been accumulated.",
-                    continuation_packet.channel
+                    "[Packet Collector] [Channel: {}]: Seq: {}, Accumulated {}/{} bytes",
+                    continuation_packet.channel,
+                    continuation_packet.sequence,
+                    channel_payload.data.len(),
+                    channel_payload.data.capacity()
                 );
-                Ok(Collected::Complete)
-            } else {
+
+                if channel_payload.data.len() >= channel_payload.data.capacity() {
+                    debug!(
+                        "[Packet Collector] [Channel: {}]: All packets have been accumulated.",
+                        continuation_packet.channel
+                    );
+                    return Ok(Collected::Complete);
+                }
+
                 channel_payload.next_expected_sequence += 1;
-                collect_until(ctaphid, deadline)
             }
-        }
-        Packet::Initialization(_) => {
-            // A new request arrived while we were still collecting this one.
-            // Let the dispatcher handle it, then report the channel as busy;
-            // dropping it silently leaves the host waiting for a response.
-            if let Some((other_channel, _)) =
-                ctaphid.event_handler(OutputEvent::Output { data: report_bytes })?
-            {
-                ctaphid.send_portocal_error(other_channel, DeviceError::ChannelBusy)?;
+            Packet::Initialization(init_packet) => {
+                // INIT on the channel being assembled is the host's abort and
+                // re-synchronise request (§11.2.5.3): let it discard this
+                // payload and reply.
+                if init_packet.command == Command::Init && init_packet.channel == channel {
+                    ctaphid.event_handler(OutputEvent::Output { data: report_bytes })?;
+                    return Ok(Collected::Interrupted);
+                }
+
+                // Anything else belongs to another transaction. It fails as
+                // busy (§11.2.5.1) and must not disturb the message in
+                // flight.
+                error!(
+                    "Channel {} is busy; rejecting {:?} on channel {}",
+                    channel, init_packet.command, init_packet.channel
+                );
+                ctaphid.send_portocal_error(init_packet.channel, DeviceError::ChannelBusy)?;
             }
-            Ok(Collected::Interrupted)
         }
     }
 }

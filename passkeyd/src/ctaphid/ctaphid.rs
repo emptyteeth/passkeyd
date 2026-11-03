@@ -65,6 +65,20 @@ pub(crate) fn parse_report(report_bytes: &[u8]) -> Result<Packet<Vec<u8>>, Malfo
     })
 }
 
+/// Which channel the INIT reply is sent on, and which CID it carries.
+///
+/// §11.2.9.1.3: on the broadcast channel INIT allocates a new CID, and the
+/// reply goes to the broadcast channel carrying that new CID. On an allocated
+/// channel it re-synchronises that channel instead: the reply names the same
+/// CID and is sent on it.
+fn init_reply_channels(request_channel: Channel) -> (Channel, Channel) {
+    if request_channel == Channel::BROADCAST {
+        (Channel::BROADCAST, generate_new_cid())
+    } else {
+        (request_channel, request_channel)
+    }
+}
+
 pub struct Ctaphid {
     pub hid: hid::UHIDDevice<File>,
     pub payload_stack: HashMap<HashableChannel, ChannelPayload>,
@@ -156,7 +170,7 @@ impl Ctaphid {
 
                 if channel_payload.data.len() < channel_payload.data.capacity() {
                     debug!("Initialization payload is incomplete, collecting additional packets.");
-                    match collect_all_packet(self) {
+                    match collect_all_packet(self, init_packet.channel) {
                         Ok(Collected::Complete) => {}
                         Ok(Collected::Interrupted) => {
                             // Something else arrived; the payload is
@@ -240,12 +254,6 @@ impl Ctaphid {
                 );
             }
             Command::Init => {
-                // if self.channel.is_some() {
-                //     self.send_error(channel, DeviceError::ChannelBusy)?;
-                //     return Ok(None);
-                // }
-                // let channel = Some(generate_new_cid());
-
                 // The nonce is the first word of the payload; a short one is a
                 // malformed request, not something to index into.
                 let Some(nonce) = data.get(..8).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
@@ -254,9 +262,19 @@ impl Ctaphid {
                     return Ok(None);
                 };
 
+                let (reply_channel, assigned_channel) = init_reply_channels(channel);
+
+                // On an allocated channel, INIT is also the host's abort and
+                // re-synchronise command: discard whatever that channel had
+                // pending before answering it.
+                if channel != Channel::BROADCAST {
+                    self.payload_stack.remove(&channel.into());
+                    self.cancelled.remove(&channel.into());
+                }
+
                 let init_reply = InitResponse {
                     nonce,
-                    channel: generate_new_cid(),
+                    channel: assigned_channel,
                     protocol_version: 0x02,
                     device_version: DeviceVersion {
                         major: 0x01,
@@ -275,7 +293,7 @@ impl Ctaphid {
                 init_reply.serialize(&mut reply_data)?;
 
                 let report_structure = InitializationPacket {
-                    channel: Channel::BROADCAST,
+                    channel: reply_channel,
                     command: Command::Init,
                     data: reply_data,
                     length: reply_data.len() as u16,
@@ -492,5 +510,26 @@ mod report_tests {
                 channel: None,
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn init_on_broadcast_allocates_a_new_channel() {
+        let (reply, assigned) = init_reply_channels(Channel::BROADCAST);
+
+        assert_eq!(reply, Channel::BROADCAST);
+        assert_ne!(assigned, Channel::BROADCAST);
+        assert_ne!(assigned, Channel::from(0u32));
+    }
+
+    #[test]
+    fn init_on_an_allocated_channel_keeps_it() {
+        let channel = Channel::from(0x0102_0304u32);
+
+        assert_eq!(init_reply_channels(channel), (channel, channel));
     }
 }
